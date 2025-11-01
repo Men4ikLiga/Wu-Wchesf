@@ -1,23 +1,41 @@
-# bot.py
 import os
 import json
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, filters,
+    ContextTypes, CallbackQueryHandler, ConversationHandler
+)
 
-# ------------------- Настройки -------------------
+# ---------------- Настройки ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATA_FILE = "dz.json"
-CD_FILE = "user_cd.json"  # для хранения cooldown пользователей
+HISTORY_FILE = "dz_history.json"
+CD_FILE = "user_cd.json"
 TZ = ZoneInfo("Europe/Amsterdam")
 ADMIN_ID = 6193109213
 COOLDOWN_HOURS = 4
 
-# Расписание (с исправлениями)
+WAIT_ADD = 1
+WAIT_REMOVE = 2
+
+# Словарь нормализации предметов
+SUBJECT_ALIAS = {
+    "русский": "Русский язык",
+    "русский язык": "Русский язык",
+    "английский": "Английский язык",
+    "английский язык": "Английский язык",
+    "технология": "Труд",
+    "труд": "Труд",
+    "литра": "Литература",
+    "литература": "Литература",
+}
+
+# ---------------- Расписание ----------------
 SCHEDULE = {
     "пн": ["Ров", "Русский язык", "Физра", "Труд", "Труд", "Русский язык", "Музыка"],
-    "вт": ["Физика", "Русский", "Алгебра", "Информатика", "Биология", "Английский язык/Труд", "Английский язык/Труд"],
+    "вт": ["Физика", "Русский язык", "Алгебра", "Информатика", "Биология", "Английский язык", "Труд"],
     "ср": ["Геометрия", "Физика", "История", "Физра", "Русский язык", "Алгебра", "Литература"],
     "чт": ["РМГ", "ТВИС", "География", "Физра", "Русский язык", "Изо", "ОФГ"],
     "пт": ["История", "Алгебра", "География", "Английский язык", "История", "Геометрия"]
@@ -29,26 +47,36 @@ SHORT_BREAK = 10
 LONG_BREAK = 40
 FIRST_LESSON_START = 8*60  # минуты от 00:00
 
-# ------------------- Хранилище -------------------
+# ---------------- Хранилище ----------------
 dz_list = []
+dz_history = []
 user_cd = {}
 
+# ---------------- Файлы ----------------
 def load_data():
-    global dz_list, user_cd
+    global dz_list, dz_history, user_cd
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
+        with open(DATA_FILE,"r",encoding="utf-8") as f:
             dz_list[:] = json.load(f)
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE,"r",encoding="utf-8") as f:
+            dz_history[:] = json.load(f)
     if os.path.exists(CD_FILE):
-        with open(CD_FILE, "r", encoding="utf-8") as f:
+        with open(CD_FILE,"r",encoding="utf-8") as f:
             user_cd.update(json.load(f))
 
 def save_data():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(dz_list, f, ensure_ascii=False, indent=2)
-    with open(CD_FILE, "w", encoding="utf-8") as f:
-        json.dump(user_cd, f, ensure_ascii=False, indent=2)
+    with open(DATA_FILE,"w",encoding="utf-8") as f:
+        json.dump(dz_list,f,ensure_ascii=False,indent=2)
+    with open(HISTORY_FILE,"w",encoding="utf-8") as f:
+        json.dump(dz_history,f,ensure_ascii=False,indent=2)
+    with open(CD_FILE,"w",encoding="utf-8") as f:
+        json.dump(user_cd,f,ensure_ascii=False,indent=2)
 
-# ------------------- Утилиты -------------------
+# ---------------- Утилиты ----------------
+def normalize_subject(name: str):
+    return SUBJECT_ALIAS.get(name.strip().lower(), name.strip())
+
 def weekday_name_from_date(d: date):
     wd = d.weekday()
     return DAYS_ORDER[wd] if wd < 5 else None
@@ -57,17 +85,17 @@ def lesson_start_end(d: date, idx: int):
     minutes = FIRST_LESSON_START
     for i in range(idx):
         minutes += LESSON_DURATION
-        minutes += LONG_BREAK if i == 2 else SHORT_BREAK
-    start = datetime.combine(d, datetime.min.time(), tzinfo=TZ) + timedelta(minutes=minutes)
+        minutes += LONG_BREAK if i==2 else SHORT_BREAK
+    start = datetime.combine(d, datetime.min.time(), tzinfo=TZ)+timedelta(minutes=minutes)
     end = start + timedelta(minutes=LESSON_DURATION)
     return start, end
 
 def find_subject_positions(subject_name):
     res = []
-    s = subject_name.lower()
+    s = normalize_subject(subject_name).lower()
     for day, lessons in SCHEDULE.items():
         for idx, lesson in enumerate(lessons):
-            if s in lesson.lower() or lesson.lower() in s:
+            if s in normalize_subject(lesson).lower():
                 res.append((day, idx))
     return res
 
@@ -97,7 +125,7 @@ def assign_one(subject, task):
     candidates.sort(key=lambda x: x[0])
     end_dt, day_key, idx, assigned_date = candidates[0]
     record = {
-        "subject": subject,
+        "subject": normalize_subject(subject),
         "task": task,
         "day": day_key,
         "lesson_index": idx,
@@ -108,6 +136,9 @@ def assign_one(subject, task):
 
 def remove_expired():
     now = datetime.now(TZ)
+    removed = [r for r in dz_list if datetime.fromisoformat(r["end_iso"]) <= now]
+    for r in removed:
+        dz_history.append({**r, "removed_at": now.isoformat(), "reason": "auto"})
     dz_list[:] = [r for r in dz_list if datetime.fromisoformat(r["end_iso"]) > now]
 
 def cooldown_check(user_id):
@@ -121,103 +152,135 @@ def cooldown_check(user_id):
     return True, None
 
 def format_timedelta(td: timedelta):
-    h, remainder = divmod(int(td.total_seconds()), 3600)
-    m, _ = divmod(remainder, 60)
-    parts = []
-    if h > 0:
-        parts.append(f"{h}ч")
-    if m > 0:
-        parts.append(f"{m}м")
+    h, remainder = divmod(int(td.total_seconds()),3600)
+    m, _ = divmod(remainder,60)
+    parts=[]
+    if h>0: parts.append(f"{h}ч")
+    if m>0: parts.append(f"{m}м")
     return " ".join(parts) if parts else "0м"
 
 def format_dz_for_display():
     remove_expired()
     if not dz_list:
         return "🗒 Домашек нет — всё чисто."
-    # Сгруппировать по дню
     grouped = {}
     for r in dz_list:
         grouped.setdefault(r["day"], []).append(r)
-    # сортировка по дням и урокам
     text = "📚 ДОМАШНИЕ ЗАДАНИЯ\n"
     for day in DAYS_ORDER:
         if day not in grouped:
             continue
         text += f"\n🗓 {day.upper()}\n"
-        lessons = sorted(grouped[day], key=lambda x: x["lesson_index"])
+        lessons = sorted(grouped[day], key=lambda x:x["lesson_index"])
         for r in lessons:
-            text += f"▫️ {r['subject'].capitalize()}\n{r['task']}\n\n"
-        text += "━━━━━━━━━━━━━━━━━━━━━━━━"
+            text += f"▫️ **{r['subject']}**\n> {r['task']}\n\n"
+        text += "─ ─ ─\n"
     return text
 
-# ------------------- Обработчики -------------------
+def format_history():
+    if not dz_history:
+        return "Истории удалённых ДЗ пока нет."
+    lines=[]
+    for r in dz_history[-20:]:
+        dt = r.get("removed_at","")
+        lines.append(f"{dt[:16]} | {r['subject']} | {r['task']}")
+    return "\n".join(lines)
+
+# ---------------- Обработчики ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("Добавить ДЗ", callback_data="add_dz"),
+         InlineKeyboardButton("Удалить ДЗ", callback_data="remove_dz")],
+        [InlineKeyboardButton("Показать ДЗ", callback_data="show_dz")]
+    ]
     await update.message.reply_text(
-        "Привет! Я бот для ДЗ.\n"
-        "Команды:\n"
-        "/add_dz — добавить ДЗ (только для админа)\n"
-        "/remove_dz — удалить ДЗ по предмету (только для админа)\n"
-        "/dz — посмотреть текущие домашние задания (раз в 4 часа для каждого)\n"
+        "Привет! Я бот для ДЗ.\nКоманды доступны через кнопки.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def add_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⚠️ Только админ может добавлять ДЗ.")
-        return
-    load_data()
-    text = update.message.text.replace("/add_dz", "", 1).strip()
-    if not text:
-        await update.message.reply_text("Отправь после /add_dz строки в формате:\nРусский язык - п 14")
-        return
-    lines = [l.strip() for l in text.splitlines() if "-" in l]
-    added = []
-    for line in lines:
-        subj, task = line.split("-", 1)
-        subj, task = subj.strip(), task.strip()
-        record = assign_one(subj, task)
-        if record:
-            dz_list.append(record)
-            added.append(record)
-    save_data()
-    await update.message.reply_text(f"✅ Добавлено {len(added)} ДЗ.")
-
-async def remove_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⚠️ Только админ может удалять ДЗ.")
-        return
-    load_data()
-    args = context.args
-    if not args:
-        await update.message.reply_text("Используй: /remove_dz <название предмета>")
-        return
-    subj = " ".join(args).lower()
-    before = len(dz_list)
-    dz_list[:] = [r for r in dz_list if subj not in r["subject"].lower()]
-    save_data()
-    await update.message.reply_text(f"✅ Удалено {before - len(dz_list)} ДЗ по предмету '{subj}'.")
-
-async def show_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def dz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     load_data()
     can_use, remaining = cooldown_check(update.effective_user.id)
     if update.effective_user.id != ADMIN_ID and not can_use:
-        await update.message.reply_text(f"⏱ Подождите {format_timedelta(remaining)} до следующего запроса ДЗ.")
+        await update.message.reply_text(
+            f"⏳ Подождите {format_timedelta(remaining)} до следующего запроса ДЗ."
+        )
         return
     if update.effective_user.id != ADMIN_ID:
         user_cd[update.effective_user.id] = datetime.now(TZ).isoformat()
         save_data()
-    text = format_dz_for_display()
-    await update.message.reply_text(text)
+    await update.message.reply_text(format_dz_for_display(), parse_mode="Markdown")
 
-# ------------------- Запуск -------------------
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    load_data()
+    await update.message.reply_text(format_history())
+
+# ---------------- Conversation ----------------
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "add_dz" and query.from_user.id == ADMIN_ID:
+        await query.message.reply_text("Отправьте ДЗ в формате:\nРусский язык - п 14, упр 85")
+        return WAIT_ADD
+    elif query.data == "remove_dz" and query.from_user.id == ADMIN_ID:
+        await query.message.reply_text("Отправьте предмет для удаления всех ДЗ:")
+        return WAIT_REMOVE
+    elif query.data == "show_dz":
+        await query.message.reply_text(format_dz_for_display(), parse_mode="Markdown")
+        return ConversationHandler.END
+    else:
+        await query.message.reply_text("Только админ может редактировать ДЗ.")
+        return ConversationHandler.END
+
+async def add_dz_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    load_data()
+    msg = update.message.text.strip()
+    if "-" not in msg:
+        await update.message.reply_text("Неверный формат. Используйте:\nПредмет - ДЗ")
+        return WAIT_ADD
+    subj, task = map(str.strip, msg.split("-",1))
+    record = assign_one(subj, task)
+    if record is None:
+        await update.message.reply_text("Предмет не найден в расписании.")
+        return WAIT_ADD
+    dz_list.append(record)
+    save_data()
+    await update.message.reply_text(f"✅ ДЗ сохранено для {normalize_subject(subj)}.")
+    return ConversationHandler.END
+
+async def remove_dz_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    load_data()
+    subj = normalize_subject(update.message.text.strip())
+    removed = [r for r in dz_list if normalize_subject(r["subject"]) == subj]
+    if not removed:
+        await update.message.reply_text("Такого предмета нет в текущих ДЗ.")
+        return WAIT_REMOVE
+    for r in removed:
+        dz_history.append({**r, "removed_at": datetime.now(TZ).isoformat(), "reason": "manual"})
+    dz_list[:] = [r for r in dz_list if normalize_subject(r["subject"]) != subj]
+    save_data()
+    await update.message.reply_text(f"✅ Все ДЗ по {subj} удалены.")
+    return ConversationHandler.END
+
+# ---------------- Main ----------------
 def main():
     load_data()
-    remove_expired()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_callback)],
+        states={
+            WAIT_ADD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_dz_msg)],
+            WAIT_REMOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_dz_msg)],
+        },
+        fallbacks=[]
+    )
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add_dz", add_dz))
-    app.add_handler(CommandHandler("remove_dz", remove_dz))
-    app.add_handler(CommandHandler("dz", show_dz))
-    print("✅ Бот запущен...")
+    app.add_handler(CommandHandler("dz", dz_command))
+    app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(conv_handler)
+
     app.run_polling()
 
 if __name__ == "__main__":
