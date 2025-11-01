@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ---------------- Настройки ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -14,10 +14,12 @@ TZ = ZoneInfo("Europe/Amsterdam")
 ADMIN_ID = 6193109213
 COOLDOWN_HOURS = 4
 
-WAIT_ADD = 1
-WAIT_REMOVE = 2
+# ---------------- Состояния ----------------
+dz_list = []
+dz_history = []
+user_cd = {}
 
-# Нормализация предметов
+# ---------------- Нормализация предметов ----------------
 SUBJECT_ALIAS = {
     "русский": "Русский язык",
     "русский язык": "Русский язык",
@@ -44,12 +46,7 @@ SHORT_BREAK = 10
 LONG_BREAK = 40
 FIRST_LESSON_START = 8*60  # минуты от 00:00
 
-# ---------------- Хранилище ----------------
-dz_list = []
-dz_history = []
-user_cd = {}
-
-# ---------------- Файлы ----------------
+# ---------------- Работа с файлами ----------------
 def load_data():
     global dz_list, dz_history, user_cd
     if os.path.exists(DATA_FILE):
@@ -156,21 +153,27 @@ def format_timedelta(td: timedelta):
     if m>0: parts.append(f"{m}м")
     return " ".join(parts) if parts else "0м"
 
+# ---------------- Форматирование ДЗ ----------------
 def format_dz_for_display():
     remove_expired()
     if not dz_list:
         return "🗒 Домашек нет — всё чисто."
+    
     grouped = {}
     for r in dz_list:
-        grouped.setdefault(r["day"], []).append(r)
+        day = r["day"]
+        grouped.setdefault(day, []).append(r)
+
     text = "📚 ДОМАШНИЕ ЗАДАНИЯ\n"
     for day in DAYS_ORDER:
         if day not in grouped:
             continue
         text += f"\n🗓 {day.upper()}\n"
-        lessons = sorted(grouped[day], key=lambda x:x["lesson_index"])
+        lessons = sorted(grouped[day], key=lambda x: x["lesson_index"])
         for r in lessons:
-            text += f"▫️ **{r['subject']}**\n> {r['task']}\n\n"
+            subject = r["subject"]
+            task = r["task"]
+            text += f"▫️ **{subject}**\n> {task}\n\n"  # отдельный блок
         text += "─ ─ ─\n"
     return text
 
@@ -183,7 +186,7 @@ def format_history():
         lines.append(f"{dt[:16]} | {r['subject']} | {r['task']}")
     return "\n".join(lines)
 
-# ---------------- Обработчики ----------------
+# ---------------- Команды ----------------
 async def dz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     load_data()
     can_use, remaining = cooldown_check(update.effective_user.id)
