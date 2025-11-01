@@ -1,182 +1,176 @@
-import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from datetime import datetime, timedelta
+import datetime
 import json
 import os
+import asyncio
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
 
-# Настройка логирования
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
+# =====================================================
+# ВСТАВЬ СВОЙ ТОКЕН В ПЕРЕМЕННУЮ ОКРУЖЕНИЯ BOT_TOKEN
+# На Render / Replit / Railway / PythonAnywhere добавь переменную:
+# BOT_TOKEN = "твой токен"
+# =====================================================
 
-# Получаем токен из переменных окружения
-BOT_TOKEN = os.environ.get('BOT_TOKEN') or os.environ.get('TELEGRAM_BOT_TOKEN')
+TOKEN = os.getenv("BOT_TOKEN")
+DATA_FILE = "dz.json"
 
-if not BOT_TOKEN:
-    raise ValueError("Токен бота не найден! Убедитесь, что переменная окружения BOT_TOKEN или TELEGRAM_BOT_TOKEN установлена.")
-
-# Расписание уроков
-SCHEDULE = {
-    0: ["Ров", "Русский язык", "физра", "Технология", "Технология", "Русский язык", "Музыка"],
-    1: ["Физика", "Русский", "Алгебра", "Информатика", "Биология", "Английский/Технология", "Английский/Технология"],
-    2: ["Геометрия", "Физика", "История", "Физра", "Русский язык", "Алгебра", "Литра"],
-    3: ["РМГ", "ТВИС", "География", "Физра", "Русский", "Изо", "ОФГ"],
-    4: ["История", "Алгебра", "География", "Английский", "История", "Геометрия"]
+# ====== РАСПИСАНИЕ ======
+schedule = {
+    "пн": ["Ров", "Русский язык", "Физра", "Технология", "Технология", "Русский язык", "Музыка"],
+    "вт": ["Физика", "Русский", "Алгебра", "Информатика", "Биология", "Английский/Технология", "Английский/Технология"],
+    "ср": ["Геометрия", "Физика", "История", "Физра", "Русский язык", "Алгебра", "Литра"],
+    "чт": ["РМГ", "ТВИС", "География", "Физра", "Русский", "Изо", "ОФГ"],
+    "пт": ["История", "Алгебра", "География", "Английский", "История", "Геометрия"]
 }
 
-# Точное время начала уроков (8:00 + 40 мин урок + 10 мин перемена, кроме 3->4 = 20 мин)
-LESSON_TIMES = [
-    datetime.strptime("08:00", "%H:%M").time(),   # 1 урок
-    datetime.strptime("08:50", "%H:%M").time(),   # 2 урок  
-    datetime.strptime("09:40", "%H:%M").time(),   # 3 урок
-    datetime.strptime("10:30", "%H:%M").time(),   # 4 урок (перемена 20 мин)
-    datetime.strptime("11:30", "%H:%M").time(),   # 5 урок
-    datetime.strptime("12:20", "%H:%M").time(),   # 6 урок
-    datetime.strptime("13:10", "%H:%M").time()    # 7 урок
-]
+# ====== ХРАНИЛИЩЕ ======
+dz_data = {}
 
-class HomeworkBot:
-    def __init__(self):
-        self.homework_file = "homework.json"
-        self.homework = self.load_homework()
-    
-    def load_homework(self):
-        if os.path.exists(self.homework_file):
-            with open(self.homework_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {}
-    
-    def save_homework(self):
-        with open(self.homework_file, 'w', encoding='utf-8') as f:
-            json.dump(self.homework, f, ensure_ascii=False, indent=2)
-    
-    def get_next_lesson_date(self, subject):
-        today = datetime.now()
-        current_day = today.weekday()
-        current_time = today.time()
-        
-        # Проверяем сегодняшние уроки
-        if current_day in SCHEDULE:
-            today_lessons = SCHEDULE[current_day]
-            for i, lesson in enumerate(today_lessons):
-                if lesson == subject:
-                    lesson_time = LESSON_TIMES[i]
-                    # Если урок еще не прошел сегодня
-                    if current_time < lesson_time:
-                        return today.date().isoformat()
-        
-        # Ищем следующий день с этим предметом
-        days_ahead = 1
-        while days_ahead <= 7:
-            next_day = (current_day + days_ahead) % 7
-            if next_day in SCHEDULE and subject in SCHEDULE[next_day]:
-                next_date = today + timedelta(days=days_ahead)
-                return next_date.date().isoformat()
-            days_ahead += 1
-        
+# ====== УТИЛИТЫ ======
+
+def load_data():
+    global dz_data
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            try:
+                dz_data.update(json.load(f))
+            except json.JSONDecodeError:
+                dz_data.clear()
+
+def save_data():
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(dz_data, f, ensure_ascii=False, indent=2)
+
+def parse_dz(text: str):
+    parsed = []
+    for line in text.split("\n"):
+        if "-" in line:
+            subj, task = line.split("-", 1)
+            subj = subj.strip()
+            task = task.strip()
+            parsed.append((subj, task))
+    return parsed
+
+def find_next_day(subj, today_index):
+    days = list(schedule.keys())
+    for i in range(7):
+        idx = (today_index + i) % 5
+        day_key = days[idx]
+        if any(subj.lower() in s.lower() for s in schedule[day_key]):
+            return day_key
+    return days[0]
+
+def get_lesson_end_time(day, subj):
+    lessons = schedule[day]
+    if subj not in lessons:
         return None
-    
-    def cleanup_old_homework(self):
-        today = datetime.now().date()
-        current_day = today.weekday()
-        current_time = datetime.now().time()
-        
-        for subject in list(self.homework.keys()):
-            hw_date_str = self.homework[subject].get('date')
-            if hw_date_str:
-                hw_date = datetime.fromisoformat(hw_date_str).date()
-                if hw_date < today:
-                    del self.homework[subject]
-                elif hw_date == today:
-                    # Удаляем если урок уже прошел сегодня
-                    if current_day in SCHEDULE:
-                        today_lessons = SCHEDULE[current_day]
-                        if subject in today_lessons:
-                            lesson_index = today_lessons.index(subject)
-                            if lesson_index < len(LESSON_TIMES) and current_time > LESSON_TIMES[lesson_index]:
-                                del self.homework[subject]
-    
-    async def add_dz(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = str(update.effective_user.id)
-        
-        if user_id not in self.homework:
-            self.homework[user_id] = {}
-        
-        current_subject = None
-        lines = update.message.text.split('\n')
-        
-        for line in lines[1:]:  # Пропускаем команду /add_dz
-            line = line.strip()
-            if not line:
-                continue
-                
-            # Проверяем, является ли строка названием предмета
-            is_subject = False
-            for day_lessons in SCHEDULE.values():
-                for lesson in day_lessons:
-                    if lesson in line:
-                        current_subject = lesson
-                        is_subject = True
-                        break
-                if is_subject:
-                    break
-            
-            if not is_subject and current_subject and line:
-                # Это домашнее задание для текущего предмета
-                next_date = self.get_next_lesson_date(current_subject)
-                if next_date:
-                    self.homework[user_id][current_subject] = {
-                        'task': line,
-                        'date': next_date
-                    }
-        
-        self.save_homework()
-        await update.message.reply_text("Домашнее задание добавлено!")
-    
-    async def show_dz(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = str(update.effective_user.id)
-        self.cleanup_old_homework()
-        self.save_homework()
-        
-        if user_id not in self.homework or not self.homework[user_id]:
-            await update.message.reply_text("Нет домашних заданий!")
-            return
-        
-        response = "📚 Ваши домашние задания:\n\n"
-        for subject, hw in self.homework[user_id].items():
-            date_obj = datetime.fromisoformat(hw['date']).date()
-            today = datetime.now().date()
-            
-            if date_obj == today:
-                date_str = "Сегодня"
-            elif date_obj == today + timedelta(days=1):
-                date_str = "Завтра"
+    idx = lessons.index(subj)
+    start = datetime.datetime.now().replace(hour=8, minute=0, second=0, microsecond=0)
+    total_minutes = 0
+    for i in range(idx):
+        total_minutes += 40
+        total_minutes += 10 if i != 2 else 40
+    end_time = start + datetime.timedelta(minutes=total_minutes + 40)
+    return end_time.isoformat()
+
+def remove_expired_dz():
+    now = datetime.datetime.now()
+    changed = False
+    for day in list(dz_data.keys()):
+        new_tasks = []
+        for subj, task, end_time in dz_data[day]:
+            if not end_time:
+                new_tasks.append((subj, task, end_time))
             else:
-                date_str = date_obj.strftime("%d.%m")
-                
-            response += f"📖 {subject} ({date_str}):\n{hw['task']}\n\n"
-        
-        await update.message.reply_text(response)
-    
-    async def clear_dz(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = str(update.effective_user.id)
-        if user_id in self.homework:
-            self.homework[user_id] = {}
-            self.save_homework()
-        await update.message.reply_text("Все домашние задания очищены!")
+                dt = datetime.datetime.fromisoformat(end_time)
+                if dt > now:
+                    new_tasks.append((subj, task, end_time))
+        if new_tasks:
+            dz_data[day] = new_tasks
+        else:
+            del dz_data[day]
+            changed = True
+    if changed:
+        save_data()
 
-# Создание и настройка бота
-def main():
-    bot = HomeworkBot()
-    
-    # Используем правильную переменную с токеном
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    application.add_handler(CommandHandler("add_dz", bot.add_dz))
-    application.add_handler(CommandHandler("dz", bot.show_dz))
-    application.add_handler(CommandHandler("clear", bot.clear_dz))
-    
-    application.run_polling()
+# ====== ХЕНДЛЕРЫ ======
 
-if __name__ == '__main__':
-    main()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Привет! Я бот для хранения домашки.\n"
+        "Команды:\n"
+        "/add_dz — добавить дз\n"
+        "/dz — показать всё дз\n"
+        "/clear — очистить всё"
+    )
+
+async def add_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отправь список дз в формате:\n\nРусский - параграф 6\nФизика - упражнение 7\n\nКогда закончишь, напиши 'готово'.")
+    context.user_data["adding"] = True
+    context.user_data["buffer"] = []
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("adding"):
+        text = update.message.text.strip()
+        if text.lower() == "готово":
+            added_text = "\n".join(context.user_data["buffer"])
+            parsed = parse_dz(added_text)
+            today = datetime.datetime.now().weekday()
+            for subj, task in parsed:
+                day = find_next_day(subj, today)
+                if day not in dz_data:
+                    dz_data[day] = []
+                dz_data[day].append((subj, task, get_lesson_end_time(day, subj)))
+            save_data()
+            context.user_data["adding"] = False
+            context.user_data["buffer"] = []
+            await update.message.reply_text("✅ Домашка сохранена.")
+        else:
+            context.user_data["buffer"].append(text)
+    else:
+        await update.message.reply_text("Не понимаю сообщение. Используй /dz или /add_dz.")
+
+async def show_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    remove_expired_dz()
+    if not dz_data:
+        await update.message.reply_text("📭 Домашки нет!")
+        return
+    text = ""
+    for day, tasks in dz_data.items():
+        text += f"\n📅 *{day.upper()}*\n"
+        for subj, task, _ in tasks:
+            text += f"📘 {subj}: {task}\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def clear_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    dz_data.clear()
+    save_data()
+    await update.message.reply_text("🧹 Всё дз очищено.")
+
+# ====== АВТОЧИСТКА ======
+async def auto_cleanup():
+    while True:
+        remove_expired_dz()
+        await asyncio.sleep(600)  # каждые 10 минут проверяет актуальность
+
+# ====== MAIN ======
+async def main():
+    load_data()
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("add_dz", add_dz))
+    app.add_handler(CommandHandler("dz", show_dz))
+    app.add_handler(CommandHandler("clear", clear_dz))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    asyncio.create_task(auto_cleanup())
+
+    print("✅ Бот запущен...")
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
