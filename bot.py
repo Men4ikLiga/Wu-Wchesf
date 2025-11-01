@@ -167,9 +167,7 @@ def main():
     bot = HomeworkBot()
     
     # Замените 'YOUR_TOKEN' на переменную окружения
-    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    if not TOKEN:
-        raise ValueError("Не установлен TELEGRAM_BOT_TOKEN")
+    
     
     application = Application.builder().token(TOKEN).build()
     
