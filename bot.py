@@ -2,11 +2,8 @@ import os
 import json
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, filters,
-    ContextTypes, CallbackQueryHandler, ConversationHandler
-)
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 # ---------------- Настройки ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -20,7 +17,7 @@ COOLDOWN_HOURS = 4
 WAIT_ADD = 1
 WAIT_REMOVE = 2
 
-# Словарь нормализации предметов
+# Нормализация предметов
 SUBJECT_ALIAS = {
     "русский": "Русский язык",
     "русский язык": "Русский язык",
@@ -187,17 +184,6 @@ def format_history():
     return "\n".join(lines)
 
 # ---------------- Обработчики ----------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Добавить ДЗ", callback_data="add_dz"),
-         InlineKeyboardButton("Удалить ДЗ", callback_data="remove_dz")],
-        [InlineKeyboardButton("Показать ДЗ", callback_data="show_dz")]
-    ]
-    await update.message.reply_text(
-        "Привет! Я бот для ДЗ.\nКоманды доступны через кнопки.",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
 async def dz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     load_data()
     can_use, remaining = cooldown_check(update.effective_user.id)
@@ -211,76 +197,53 @@ async def dz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data()
     await update.message.reply_text(format_dz_for_display(), parse_mode="Markdown")
 
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    load_data()
-    await update.message.reply_text(format_history())
-
-# ---------------- Conversation ----------------
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "add_dz" and query.from_user.id == ADMIN_ID:
-        await query.message.reply_text("Отправьте ДЗ в формате:\nРусский язык - п 14, упр 85")
-        return WAIT_ADD
-    elif query.data == "remove_dz" and query.from_user.id == ADMIN_ID:
-        await query.message.reply_text("Отправьте предмет для удаления всех ДЗ:")
-        return WAIT_REMOVE
-    elif query.data == "show_dz":
-        await query.message.reply_text(format_dz_for_display(), parse_mode="Markdown")
-        return ConversationHandler.END
-    else:
-        await query.message.reply_text("Только админ может редактировать ДЗ.")
-        return ConversationHandler.END
-
-async def add_dz_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    load_data()
-    msg = update.message.text.strip()
-    if "-" not in msg:
-        await update.message.reply_text("Неверный формат. Используйте:\nПредмет - ДЗ")
-        return WAIT_ADD
-    subj, task = map(str.strip, msg.split("-",1))
+async def add_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Только админ может добавлять ДЗ.")
+        return
+    text = " ".join(context.args)
+    if "-" not in text:
+        await update.message.reply_text("Используйте формат: /add_dz Предмет - ДЗ")
+        return
+    subj, task = map(str.strip, text.split("-",1))
     record = assign_one(subj, task)
-    if record is None:
+    if not record:
         await update.message.reply_text("Предмет не найден в расписании.")
-        return WAIT_ADD
+        return
+    load_data()
     dz_list.append(record)
     save_data()
     await update.message.reply_text(f"✅ ДЗ сохранено для {normalize_subject(subj)}.")
-    return ConversationHandler.END
 
-async def remove_dz_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def remove_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Только админ может удалять ДЗ.")
+        return
+    subj = " ".join(context.args)
+    subj = normalize_subject(subj)
     load_data()
-    subj = normalize_subject(update.message.text.strip())
     removed = [r for r in dz_list if normalize_subject(r["subject"]) == subj]
     if not removed:
         await update.message.reply_text("Такого предмета нет в текущих ДЗ.")
-        return WAIT_REMOVE
+        return
     for r in removed:
         dz_history.append({**r, "removed_at": datetime.now(TZ).isoformat(), "reason": "manual"})
     dz_list[:] = [r for r in dz_list if normalize_subject(r["subject"]) != subj]
     save_data()
     await update.message.reply_text(f"✅ Все ДЗ по {subj} удалены.")
-    return ConversationHandler.END
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    load_data()
+    await update.message.reply_text(format_history())
 
 # ---------------- Main ----------------
 def main():
     load_data()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_callback)],
-        states={
-            WAIT_ADD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_dz_msg)],
-            WAIT_REMOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_dz_msg)],
-        },
-        fallbacks=[]
-    )
-
-    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("dz", dz_command))
+    app.add_handler(CommandHandler("add_dz", add_dz))
+    app.add_handler(CommandHandler("remove_dz", remove_dz))
     app.add_handler(CommandHandler("history", history_command))
-    app.add_handler(conv_handler)
-
     app.run_polling()
 
 if __name__ == "__main__":
