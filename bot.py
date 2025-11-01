@@ -1,148 +1,180 @@
-import os
-import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from datetime import datetime, timedelta
+import json
+import os
 
-# Настройка
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    print("❌ Ошибка: BOT_TOKEN не установлен!")
-    exit(1)
+# Настройка логирования
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+# Расписание уроков
+SCHEDULE = {
+    0: ["Ров", "Русский язык", "физра", "Технология", "Технология", "Русский язык", "Музыка"],
+    1: ["Физика", "Русский", "Алгебра", "Информатика", "Биология", "Английский/Технология", "Английский/Технология"],
+    2: ["Геометрия", "Физика", "История", "Физра", "Русский язык", "Алгебра", "Литра"],
+    3: ["РМГ", "ТВИС", "География", "Физра", "Русский", "Изо", "ОФГ"],
+    4: ["История", "Алгебра", "География", "Английский", "История", "Геометрия"]
+}
 
-# Храним привязанные группы
-user_groups = {}
+# Точное время начала уроков (8:00 + 40 мин урок + 10 мин перемена, кроме 3->4 = 20 мин)
+LESSON_TIMES = [
+    datetime.strptime("08:00", "%H:%M").time(),   # 1 урок
+    datetime.strptime("08:50", "%H:%M").time(),   # 2 урок  
+    datetime.strptime("09:40", "%H:%M").time(),   # 3 урок
+    datetime.strptime("10:30", "%H:%M").time(),   # 4 урок (перемена 20 мин)
+    datetime.strptime("11:30", "%H:%M").time(),   # 5 урок
+    datetime.strptime("12:20", "%H:%M").time(),   # 6 урок
+    datetime.strptime("13:10", "%H:%M").time()    # 7 урок
+]
 
-@dp.message(Command("start"))
-async def start_cmd(message: types.Message):
-    await message.answer(
-        "🤖 Бот для упоминания участников\n\n"
-        "📋 Команды:\n"
-        "/bind - Привязать к группе\n" 
-        "/all - Пинг всех участников\n"
-        "/info - Информация о группе"
-    )
-
-@dp.message(Command("bind"))
-async def bind_cmd(message: types.Message):
-    if message.chat.type == "private":
-        await message.answer("❌ Используй в группе!")
-        return
+class HomeworkBot:
+    def __init__(self):
+        self.homework_file = "homework.json"
+        self.homework = self.load_homework()
     
-    user_groups[message.from_user.id] = message.chat.id
-    await message.answer(f"✅ Группа '{message.chat.title}' привязана!")
-
-@dp.message(Command("info")) 
-async def info_cmd(message: types.Message):
-    if message.chat.type != "private":
-        return
+    def load_homework(self):
+        if os.path.exists(self.homework_file):
+            with open(self.homework_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return {}
     
-    chat_id = user_groups.get(message.from_user.id)
-    if not chat_id:
-        await message.answer("❌ Группа не привязана!")
-        return
+    def save_homework(self):
+        with open(self.homework_file, 'w', encoding='utf-8') as f:
+            json.dump(self.homework, f, ensure_ascii=False, indent=2)
     
-    try:
-        chat = await bot.get_chat(chat_id)
-        members_count = await bot.get_chat_member_count(chat_id)
-        await message.answer(f"📋 Группа: {chat.title}\n👥 Участников: {members_count}")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-
-@dp.message(Command("all"))
-async def all_cmd(message: types.Message):
-    if message.chat.type != "private":
-        await message.answer("❌ Используй в ЛС!")
-        return
-    
-    user_id = message.from_user.id
-    chat_id = user_groups.get(user_id)
-    
-    if not chat_id:
-        await message.answer("❌ Группа не привязана! Используй /bind в группе")
-        return
-    
-    try:
-        # Получаем количество участников
-        members_count = await bot.get_chat_member_count(chat_id)
-        await message.answer(f"🔍 Начинаю сбор участников... Всего: {members_count}")
+    def get_next_lesson_date(self, subject):
+        today = datetime.now()
+        current_day = today.weekday()
+        current_time = today.time()
         
-        # Получаем администраторов чтобы их исключить (если нужно)
-        admins = []
-        try:
-            async for admin in bot.get_chat_administrators(chat_id):
-                admins.append(admin.user.id)
-        except:
-            pass
+        # Проверяем сегодняшние уроки
+        if current_day in SCHEDULE:
+            today_lessons = SCHEDULE[current_day]
+            for i, lesson in enumerate(today_lessons):
+                if lesson == subject:
+                    lesson_time = LESSON_TIMES[i]
+                    # Если урок еще не прошел сегодня
+                    if current_time < lesson_time:
+                        return today.date().isoformat()
         
-        # Получаем участников через offset
-        members = []
-        offset = 0
-        limit = 200
+        # Ищем следующий день с этим предметом
+        days_ahead = 1
+        while days_ahead <= 7:
+            next_day = (current_day + days_ahead) % 7
+            if next_day in SCHEDULE and subject in SCHEDULE[next_day]:
+                next_date = today + timedelta(days=days_ahead)
+                return next_date.date().isoformat()
+            days_ahead += 1
         
-        while len(members) < members_count:
-            try:
-                # В aiogram 3.x нужно использовать get_chat_members с параметрами
-                chat_members = []
-                async for member in bot.get_chat_members(chat_id, offset=offset, limit=limit):
-                    chat_members.append(member)
-                    offset += 1
+        return None
+    
+    def cleanup_old_homework(self):
+        today = datetime.now().date()
+        current_day = today.weekday()
+        current_time = datetime.now().time()
+        
+        for subject in list(self.homework.keys()):
+            hw_date_str = self.homework[subject].get('date')
+            if hw_date_str:
+                hw_date = datetime.fromisoformat(hw_date_str).date()
+                if hw_date < today:
+                    del self.homework[subject]
+                elif hw_date == today:
+                    # Удаляем если урок уже прошел сегодня
+                    if current_day in SCHEDULE:
+                        today_lessons = SCHEDULE[current_day]
+                        if subject in today_lessons:
+                            lesson_index = today_lessons.index(subject)
+                            if lesson_index < len(LESSON_TIMES) and current_time > LESSON_TIMES[lesson_index]:
+                                del self.homework[subject]
+    
+    async def add_dz(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        
+        if user_id not in self.homework:
+            self.homework[user_id] = {}
+        
+        current_subject = None
+        lines = update.message.text.split('\n')
+        
+        for line in lines[1:]:  # Пропускаем команду /add_dz
+            line = line.strip()
+            if not line:
+                continue
                 
-                if not chat_members:
+            # Проверяем, является ли строка названием предмета
+            is_subject = False
+            for day_lessons in SCHEDULE.values():
+                for lesson in day_lessons:
+                    if lesson in line:
+                        current_subject = lesson
+                        is_subject = True
+                        break
+                if is_subject:
                     break
-                    
-                for member in chat_members:
-                    user = member.user
-                    if not user.is_bot and user.id not in admins:  # Исключаем ботов и админов если нужно
-                        members.append(user)
-                        
-                if len(chat_members) < limit:
-                    break
-                    
-            except Exception as e:
-                await message.answer(f"❌ Ошибка при получении участников: {e}")
-                break
+            
+            if not is_subject and current_subject and line:
+                # Это домашнее задание для текущего предмета
+                next_date = self.get_next_lesson_date(current_subject)
+                if next_date:
+                    self.homework[user_id][current_subject] = {
+                        'task': line,
+                        'date': next_date
+                    }
         
-        if not members:
-            await message.answer("❌ Не удалось получить участников")
+        self.save_homework()
+        await update.message.reply_text("Домашнее задание добавлено!")
+    
+    async def show_dz(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        self.cleanup_old_homework()
+        self.save_homework()
+        
+        if user_id not in self.homework or not self.homework[user_id]:
+            await update.message.reply_text("Нет домашних заданий!")
             return
         
-        # Создаём упоминания
-        mentions = []
-        for user in members:
-            if user.username:
-                mentions.append(f"@{user.username}")
-            else:
-                name = user.first_name or "Участник"
-                mentions.append(f'<a href="tg://user?id={user.id}">{name}</a>')
-        
-        # Отправляем частями
-        chunk_size = 15
-        total_sent = 0
-        
-        for i in range(0, len(mentions), chunk_size):
-            chunk = mentions[i:i + chunk_size]
-            text = "📢 Внимание всем!\\n" + " ".join(chunk)
+        response = "📚 Ваши домашние задания:\n\n"
+        for subject, hw in self.homework[user_id].items():
+            date_obj = datetime.fromisoformat(hw['date']).date()
+            today = datetime.now().date()
             
-            try:
-                await bot.send_message(chat_id, text, parse_mode="HTML")
-                total_sent += len(chunk)
-                await asyncio.sleep(1)  # Задержка против ограничений
-            except Exception as e:
-                await message.answer(f"⚠️ Не удалось отправить часть упоминаний: {e}")
-                continue
+            if date_obj == today:
+                date_str = "Сегодня"
+            elif date_obj == today + timedelta(days=1):
+                date_str = "Завтра"
+            else:
+                date_str = date_obj.strftime("%d.%m")
+                
+            response += f"📖 {subject} ({date_str}):\n{hw['task']}\n\n"
         
-        await message.answer(f"✅ Успешно упомянуто {total_sent} участников!")
-        
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        await update.message.reply_text(response)
+    
+    async def clear_dz(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        if user_id in self.homework:
+            self.homework[user_id] = {}
+            self.save_homework()
+        await update.message.reply_text("Все домашние задания очищены!")
 
-async def main():
-    print("🚀 Бот запущен!")
-    await dp.start_polling(bot)
+# Создание и настройка бота
+def main():
+    bot = HomeworkBot()
+    
+    # Замените 'YOUR_TOKEN' на переменную окружения
+    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+    if not TOKEN:
+        raise ValueError("Не установлен TELEGRAM_BOT_TOKEN")
+    
+    application = Application.builder().token(TOKEN).build()
+    
+    application.add_handler(CommandHandler("add_dz", bot.add_dz))
+    application.add_handler(CommandHandler("dz", bot.show_dz))
+    application.add_handler(CommandHandler("clear", bot.clear_dz))
+    
+    application.run_polling()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == '__main__':
+    main()
