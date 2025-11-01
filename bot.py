@@ -10,7 +10,12 @@ import os
 # Настройка логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
+
+# Получаем токен из переменных окружения
+BOT_TOKEN = os.environ.get('BOT_TOKEN') or os.environ.get('TELEGRAM_BOT_TOKEN')
+
+if not BOT_TOKEN:
+    raise ValueError("Токен бота не найден! Убедитесь, что переменная окружения BOT_TOKEN или TELEGRAM_BOT_TOKEN установлена.")
 
 # Расписание уроков
 SCHEDULE = {
@@ -166,10 +171,8 @@ class HomeworkBot:
 def main():
     bot = HomeworkBot()
     
-    # Замените 'YOUR_TOKEN' на переменную окружения
-    
-    
-    application = Application.builder().token(TOKEN).build()
+    # Используем правильную переменную с токеном
+    application = Application.builder().token(BOT_TOKEN).build()
     
     application.add_handler(CommandHandler("add_dz", bot.add_dz))
     application.add_handler(CommandHandler("dz", bot.show_dz))
