@@ -44,28 +44,28 @@ DAYS_ORDER = ["пн", "вт", "ср", "чт", "пт"]
 LESSON_DURATION = 40
 SHORT_BREAK = 10
 LONG_BREAK = 40
-FIRST_LESSON_START = 8*60  # минуты от 00:00
+FIRST_LESSON_START = 8 * 60  # минуты от 00:00
 
 # ---------------- Работа с файлами ----------------
 def load_data():
     global dz_list, dz_history, user_cd
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE,"r",encoding="utf-8") as f:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
             dz_list[:] = json.load(f)
     if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE,"r",encoding="utf-8") as f:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
             dz_history[:] = json.load(f)
     if os.path.exists(CD_FILE):
-        with open(CD_FILE,"r",encoding="utf-8") as f:
+        with open(CD_FILE, "r", encoding="utf-8") as f:
             user_cd.update(json.load(f))
 
 def save_data():
-    with open(DATA_FILE,"w",encoding="utf-8") as f:
-        json.dump(dz_list,f,ensure_ascii=False,indent=2)
-    with open(HISTORY_FILE,"w",encoding="utf-8") as f:
-        json.dump(dz_history,f,ensure_ascii=False,indent=2)
-    with open(CD_FILE,"w",encoding="utf-8") as f:
-        json.dump(user_cd,f,ensure_ascii=False,indent=2)
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(dz_list, f, ensure_ascii=False, indent=2)
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(dz_history, f, ensure_ascii=False, indent=2)
+    with open(CD_FILE, "w", encoding="utf-8") as f:
+        json.dump(user_cd, f, ensure_ascii=False, indent=2)
 
 # ---------------- Утилиты ----------------
 def normalize_subject(name: str):
@@ -79,17 +79,18 @@ def lesson_start_end(d: date, idx: int):
     minutes = FIRST_LESSON_START
     for i in range(idx):
         minutes += LESSON_DURATION
-        minutes += LONG_BREAK if i==2 else SHORT_BREAK
-    start = datetime.combine(d, datetime.min.time(), tzinfo=TZ)+timedelta(minutes=minutes)
+        minutes += LONG_BREAK if i == 2 else SHORT_BREAK
+    start = datetime.combine(d, datetime.min.time(), tzinfo=TZ) + timedelta(minutes=minutes)
     end = start + timedelta(minutes=LESSON_DURATION)
     return start, end
 
 def find_subject_positions(subject_name):
+    """Поиск точного совпадения предмета."""
     res = []
-    s = normalize_subject(subject_name).lower()
+    normalized = normalize_subject(subject_name).lower()
     for day, lessons in SCHEDULE.items():
         for idx, lesson in enumerate(lessons):
-            if s in normalize_subject(lesson).lower():
+            if normalized == normalize_subject(lesson).lower():
                 res.append((day, idx))
     return res
 
@@ -146,11 +147,11 @@ def cooldown_check(user_id):
     return True, None
 
 def format_timedelta(td: timedelta):
-    h, remainder = divmod(int(td.total_seconds()),3600)
-    m, _ = divmod(remainder,60)
-    parts=[]
-    if h>0: parts.append(f"{h}ч")
-    if m>0: parts.append(f"{m}м")
+    h, remainder = divmod(int(td.total_seconds()), 3600)
+    m, _ = divmod(remainder, 60)
+    parts = []
+    if h > 0: parts.append(f"{h}ч")
+    if m > 0: parts.append(f"{m}м")
     return " ".join(parts) if parts else "0м"
 
 # ---------------- Форматирование ДЗ ----------------
@@ -173,16 +174,16 @@ def format_dz_for_display():
         for r in lessons:
             subject = r["subject"]
             task = r["task"]
-            text += f"▫️ **{subject}**\n> {task}\n\n"  # отдельный блок
+            text += f"▫️ **{subject}**\n> {task}\n\n"
         text += "─ ─ ─\n"
     return text
 
 def format_history():
     if not dz_history:
         return "Истории удалённых ДЗ пока нет."
-    lines=[]
+    lines = []
     for r in dz_history[-20:]:
-        dt = r.get("removed_at","")
+        dt = r.get("removed_at", "")
         lines.append(f"{dt[:16]} | {r['subject']} | {r['task']}")
     return "\n".join(lines)
 
@@ -191,9 +192,7 @@ async def dz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     load_data()
     can_use, remaining = cooldown_check(update.effective_user.id)
     if update.effective_user.id != ADMIN_ID and not can_use:
-        await update.message.reply_text(
-            f"⏳ Подождите {format_timedelta(remaining)} до следующего запроса ДЗ."
-        )
+        await update.message.reply_text(f"⏳ Подождите {format_timedelta(remaining)} до следующего запроса ДЗ.")
         return
     if update.effective_user.id != ADMIN_ID:
         user_cd[update.effective_user.id] = datetime.now(TZ).isoformat()
@@ -208,7 +207,7 @@ async def add_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "-" not in text:
         await update.message.reply_text("Используйте формат: /add_dz Предмет - ДЗ")
         return
-    subj, task = map(str.strip, text.split("-",1))
+    subj, task = map(str.strip, text.split("-", 1))
     record = assign_one(subj, task)
     if not record:
         await update.message.reply_text("Предмет не найден в расписании.")
