@@ -20,16 +20,16 @@ if not BOT_TOKEN:
     raise RuntimeError("Установи переменную окружения BOT_TOKEN")
 
 DATA_FILE = "dz.json"
-HISTORY_FILE = "dz_history.json"  # локальный файл больше не используется для хранения истории
-CD_FILE = "user_cd.json"
-RAS_CD_FILE = "ras_cd.json"
+HISTORY_FILE = "dz_history.json"  # теперь хранится в Gist, локальный файл не используется как основной
+CD_FILE = "user_cd.json"     # cooldown для /dz
+RAS_CD_FILE = "ras_cd.json"  # cooldown для /ras
 TZ = ZoneInfo("Europe/Amsterdam")
 ADMIN_ID = 6193109213
 COOLDOWN_HOURS = 4
 
 # --- GitHub Gist настройки ---
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GIST_ID = os.getenv("GIST_ID")  # ID Gist, где хранится dz_history.json
+GIST_ID = os.getenv("GIST_ID")  # ID Gist, в котором лежит dz_history.json
 GIST_FILENAME = "dz_history.json"
 GIST_API_URL = f"https://api.github.com/gists/{GIST_ID}" if GIST_ID else None
 
@@ -89,28 +89,32 @@ EMOJI_MAP = {
 
 # ---------------- Storage ----------------
 dz_list = []       # active assignments
-dz_history = []    # removed assignments (stored in Gist)
+dz_history = []    # removed assignments
 user_cd = {}       # cooldown map for /dz -> {user_id: iso}
 ras_cd = {}        # cooldown map for /ras -> {user_id: iso}
 
 
 # ---------------- Gist функции ----------------
+def _gist_headers():
+    return {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+
+
 def load_history_from_gist():
-    """Загружает dz_history.json из GitHub Gist (если настроено)."""
+    """Загружает dz_history.json из GitHub Gist."""
     global dz_history
     if not GIST_API_URL or not GITHUB_TOKEN:
-        print("⚠️ GITHUB_TOKEN или GIST_ID не указаны — история не будет загружена из Gist.")
+        print("⚠️ GITHUB_TOKEN или GIST_ID не указаны — история не будет загружена.")
         dz_history = []
         return
     try:
-        r = requests.get(GIST_API_URL, headers={"Authorization": f"token {GITHUB_TOKEN}"})
+        r = requests.get(GIST_API_URL, headers=_gist_headers(), timeout=10)
         if r.status_code == 200:
             gist_data = r.json()
             content = gist_data.get("files", {}).get(GIST_FILENAME, {}).get("content", "[]")
             dz_history = json.loads(content)
             print("✅ История загружена из Gist.")
         else:
-            print(f"⚠️ Ошибка при загрузке Gist: HTTP {r.status_code}")
+            print(f"⚠️ Ошибка при загрузке Gist: {r.status_code} - {r.text[:200]}")
             dz_history = []
     except Exception as e:
         print(f"⚠️ Ошибка чтения Gist: {e}")
@@ -118,9 +122,9 @@ def load_history_from_gist():
 
 
 def save_history_to_gist():
-    """Сохраняет dz_history.json в GitHub Gist (если настроено)."""
+    """Сохраняет dz_history.json в GitHub Gist."""
     if not GIST_API_URL or not GITHUB_TOKEN:
-        print("⚠️ GITHUB_TOKEN или GIST_ID не указаны — история не будет сохранена в Gist.")
+        print("⚠️ GITHUB_TOKEN или GIST_ID не указаны — история не будет сохранена.")
         return
     try:
         data = {
@@ -132,15 +136,16 @@ def save_history_to_gist():
         }
         r = requests.patch(
             GIST_API_URL,
-            headers={"Authorization": f"token {GITHUB_TOKEN}"},
+            headers=_gist_headers(),
             json=data,
+            timeout=10,
         )
         if r.status_code == 200:
             print("✅ История сохранена в Gist.")
         else:
-            print(f"⚠️ Ошибка при сохранении Gist: HTTP {r.status_code} - {r.text[:200]}")
+            print(f"⚠️ Ошибка при сохранении Gist: {r.status_code} - {r.text[:200]}")
     except Exception as e:
-        print(f"⚠️ Ошибка при записи в Gist: {e}")
+        print(f"⚠️ Ошибка при записи Gist: {e}")
 
 
 # ---------------- Persistence ----------------
@@ -157,31 +162,19 @@ def load_json_if_exists(path, default):
 def load_data():
     global dz_list, dz_history, user_cd, ras_cd
     dz_list = load_json_if_exists(DATA_FILE, [])
-    dz_history = []  # will be loaded from gist below
+    dz_history = []  # will be loaded from gist
     user_cd = load_json_if_exists(CD_FILE, {})
     ras_cd = load_json_if_exists(RAS_CD_FILE, {})
     load_history_from_gist()
 
 
 def save_all():
-    # локальные файлы (кроме истории)
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(dz_list, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ Ошибка при сохранении {DATA_FILE}: {e}")
-    try:
-        with open(CD_FILE, "w", encoding="utf-8") as f:
-            json.dump(user_cd, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ Ошибка при сохранении {CD_FILE}: {e}")
-    try:
-        with open(RAS_CD_FILE, "w", encoding="utf-8") as f:
-            json.dump(ras_cd, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ Ошибка при сохранении {RAS_CD_FILE}: {e}")
-
-    # история — в Gist
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(dz_list, f, ensure_ascii=False, indent=2)
+    with open(CD_FILE, "w", encoding="utf-8") as f:
+        json.dump(user_cd, f, ensure_ascii=False, indent=2)
+    with open(RAS_CD_FILE, "w", encoding="utf-8") as f:
+        json.dump(ras_cd, f, ensure_ascii=False, indent=2)
     save_history_to_gist()
 
 
@@ -336,6 +329,7 @@ def cooldown_check_map(map_obj, user_id):
     now = datetime.now(TZ)
     if str(user_id) not in map_obj:
         return True, None
+    last = None
     try:
         last = datetime.fromisoformat(map_obj[str(user_id)])
     except Exception:
@@ -395,7 +389,7 @@ def format_dz_for_display():
             emoji = emoji_for_subject(subj)
             # one block per lesson
             text_lines.append(f"▫️ **{subj}** {emoji}")
-            # quoted line(s)
+            # quoted line(s) — if multi-line, keep indentation
             for tline in task.split("\n"):
                 tline = tline.strip()
                 if not tline:
@@ -431,7 +425,7 @@ async def process_plain_text_add(update: Update, context: ContextTypes.DEFAULT_T
     """
     Админ может просто отправлять текст с несколькими строками:
     'Русский - п14\nФизика - упр 5'
-    Бот обработает каждую линию.
+    Бот обработает каждую строку.
     """
     if update.effective_user.id != ADMIN_ID:
         # we don't auto-add from non-admins
