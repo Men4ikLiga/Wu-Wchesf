@@ -501,19 +501,13 @@ async def process_plain_text_add(update: Update, context: ContextTypes.DEFAULT_T
 # ---------------- Command handlers ----------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "👋 Привет! Я бот для домашки.\n\n"
-        "Админ может просто отправлять сообщения с ДЗ в формате:\n"
-        "Русский язык - п 14, упр 85\n"
-        "Физика - дорешать задачи\n\n"
-        "Команды:\n"
-        "/dz — показать все ДЗ (раз в 4 часа для обычных)\n"
-        "/ras — расписание недели без ДЗ (раз в 4 часа)\n"
-        "/add_dz <Предмет> - <ДЗ> — добавить (альтернатива)\n"
-        "/remove_dz <предмет> — удалить ДЗ по предмету (админ)\n"
-        "/clear — очистить все ДЗ (админ)\n"
-        "/history — посмотреть историю удалённых ДЗ\n"
+        "👋 Привет! Я бот для домашки класса 7.1\n\n"
+        "Создатель и непосредвенный администратор -  @uwu4950"
+        "По всем вопросам пишите. доступные команнды:
+        "/dz (посмотреть задания)"
+        "/ras (рассписание)"
     )
-    await update.message.reply_text(msg)
+    зawait update.message.reply_text(msg)
 
 
 async def cmd_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
