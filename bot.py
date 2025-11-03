@@ -1,40 +1,76 @@
 # bot.py
+"""
+Telegram Homeworks Bot with GitHub Gist persistence.
+
+Requirements:
+  pip install python-telegram-bot==20.4 aiohttp
+
+Env vars required:
+  BOT_TOKEN
+  GITHUB_TOKEN
+  GIST_ID
+Optional:
+  ADMIN_ID (default 6193109213)
+  TZ (timezone, default "Europe/Riga")
+"""
+
 import os
 import re
 import json
-import requests
+import aiohttp
+import asyncio
+import logging
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
+from typing import List, Dict, Any, Optional
+from pathlib import Path
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    filters,
+    CallbackContext,
     ContextTypes,
+    filters,
 )
 
-# ---------------- CONFIG ----------------
+# ---------------- config ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("Установи переменную окружения BOT_TOKEN")
-
-DATA_FILE = "dz.json"
-HISTORY_FILE = "dz_history.json"  # теперь хранится в Gist, локальный файл не используется как основной
-CD_FILE = "user_cd.json"     # cooldown для /dz
-RAS_CD_FILE = "ras_cd.json"  # cooldown для /ras
-TZ = ZoneInfo("Europe/Amsterdam")
-ADMIN_ID = 6193109213
-COOLDOWN_HOURS = 4
-
-# --- GitHub Gist настройки ---
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GIST_ID = os.getenv("GIST_ID")  # ID Gist, в котором лежит dz_history.json
-GIST_FILENAME = "dz_history.json"
-GIST_API_URL = f"https://api.github.com/gists/{GIST_ID}" if GIST_ID else None
+GIST_ID = os.getenv("GIST_ID")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "6193109213"))
+TZ_NAME = os.getenv("TZ", "Europe/Riga")
+TZ = ZoneInfo(TZ_NAME)
+COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "4"))
 
-# ---------------- SCHEDULE & SUBJECTS ----------------
-# Исправления: Технология -> Труд, Литра -> Литература
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN required")
+if not GITHUB_TOKEN:
+    raise RuntimeError("GITHUB_TOKEN required")
+if not GIST_ID:
+    raise RuntimeError("GIST_ID required")
+
+# local storage paths (on Railway they will be ephemeral, but backups help)
+DATA_DIR = Path("/data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DZ_LOCAL = DATA_DIR / "dz.json"
+HISTORY_LOCAL = DATA_DIR / "history.json"
+BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------- logging ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("homework-bot")
+
+# ---------------- schedule and constants ----------------
+# durations for finding lesson end time (minutes)
+LESSON_DURATION = 40
+SHORT_BREAK = 10
+LONG_BREAK = 40  # between 3 and 4th lesson
+FIRST_LESSON_START = 8 * 60  # minutes from 00:00 -> 08:00
+
+# Schedule: day keys are 'пн','вт','ср','чт','пт'
 SCHEDULE = {
     "пн": ["Ров", "Русский язык", "Физра", "Труд", "Труд", "Русский язык", "Музыка"],
     "вт": ["Физика", "Русский язык", "Алгебра", "Информатика", "Биология", "Английский язык", "Труд"],
@@ -44,34 +80,35 @@ SCHEDULE = {
 }
 DAYS_ORDER = ["пн", "вт", "ср", "чт", "пт"]
 
-# длительность урока и перемен
-LESSON_DURATION = 40
-SHORT_BREAK = 10
-LONG_BREAK = 40   # между 3 и 4 уроком
-FIRST_LESSON_START_MIN = 8 * 60  # 08:00 в минутах от 00:00
-
-# subject aliases (нормализация)
+# subject normalization
 SUBJECT_ALIAS = {
     "русский": "Русский язык",
     "русский язык": "Русский язык",
     "английский": "Английский язык",
     "английский язык": "Английский язык",
+    "англ": "Английский язык",
     "технология": "Труд",
     "труд": "Труд",
     "литра": "Литература",
     "литература": "Литература",
-    # можно дополнять
+    "физра": "Физра",
+    "информатика": "Информатика",
+    "алгебра": "Алгебра",
+    "геометрия": "Геометрия",
+    "биология": "Биология",
+    "география": "География",
+    "изо": "Изо",
+    "музыка": "Музыка",
+    "история": "История",
 }
 
-# emoji per subject base word (used in /dz)
+# emoji map best-effort
 EMOJI_MAP = {
     "русский": "📘",
     "английский": "🇬🇧",
-    "матем": "🧮",
     "алгебра": "🧮",
-    "геометр": "📐",
+    "геометрия": "📐",
     "физика": "⚙️",
-    "химия": "⚗️",
     "биология": "🌿",
     "история": "📜",
     "литература": "📖",
@@ -81,121 +118,143 @@ EMOJI_MAP = {
     "география": "🗺️",
     "изо": "🎨",
     "информатика": "💻",
-    "биология": "🌿",
-    "твис": "🧾",
-    "ров": "🏫",
-    "музыка": "🎼",
 }
 
-# ---------------- Storage ----------------
-dz_list = []       # active assignments
-dz_history = []    # removed assignments
-user_cd = {}       # cooldown map for /dz -> {user_id: iso}
-ras_cd = {}        # cooldown map for /ras -> {user_id: iso}
+# in-memory data
+dz_list: List[Dict[str, Any]] = []     # each record: subject, task, day (pн..пт), lesson_index, assigned_date ISO, end_iso
+dz_history: List[Dict[str, Any]] = []  # removed records with removed_at, reason
+user_cd: Dict[str, str] = {}           # user_id -> iso last /dz
+ras_cd: Dict[str, str] = {}            # cooldown for /ras
+last_subject_for_admin: Optional[str] = None  # last used subject by admin for quick entries
 
+# regex helpers
+TIME_RE = re.compile(r"\b\d{1,2}[:.]\d{2}\b")
+DAY_WORDS = set(["пн", "вт", "ср", "чт", "пт", "понедельник", "вторник", "среда", "четверг", "пятница"])
 
-# ---------------- Gist функции ----------------
-def _gist_headers():
-    return {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
-
-
-def load_history_from_gist():
-    """Загружает dz_history.json из GitHub Gist."""
-    global dz_history
-    if not GIST_API_URL or not GITHUB_TOKEN:
-        print("⚠️ GITHUB_TOKEN или GIST_ID не указаны — история не будет загружена.")
-        dz_history = []
-        return
+# ---------------- persistence helpers ----------------
+async def load_from_gist():
+    """
+    Load dz.json and history.json from gist. If not found or network error -> load local files if exist.
+    """
+    global dz_list, dz_history
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     try:
-        r = requests.get(GIST_API_URL, headers=_gist_headers(), timeout=10)
-        if r.status_code == 200:
-            gist_data = r.json()
-            content = gist_data.get("files", {}).get(GIST_FILENAME, {}).get("content", "[]")
-            dz_history = json.loads(content)
-            print("✅ История загружена из Gist.")
-        else:
-            print(f"⚠️ Ошибка при загрузке Gist: {r.status_code} - {r.text[:200]}")
-            dz_history = []
-    except Exception as e:
-        print(f"⚠️ Ошибка чтения Gist: {e}")
-        dz_history = []
-
-
-def save_history_to_gist():
-    """Сохраняет dz_history.json в GitHub Gist."""
-    if not GIST_API_URL or not GITHUB_TOKEN:
-        print("⚠️ GITHUB_TOKEN или GIST_ID не указаны — история не будет сохранена.")
-        return
-    try:
-        data = {
-            "files": {
-                GIST_FILENAME: {
-                    "content": json.dumps(dz_history, ensure_ascii=False, indent=2)
-                }
-            }
-        }
-        r = requests.patch(
-            GIST_API_URL,
-            headers=_gist_headers(),
-            json=data,
-            timeout=10,
-        )
-        if r.status_code == 200:
-            print("✅ История сохранена в Gist.")
-        else:
-            print(f"⚠️ Ошибка при сохранении Gist: {r.status_code} - {r.text[:200]}")
-    except Exception as e:
-        print(f"⚠️ Ошибка при записи Gist: {e}")
-
-
-# ---------------- Persistence ----------------
-def load_json_if_exists(path, default):
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=15) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    files = data.get("files", {})
+                    dz_content = files.get("dz.json", {}).get("content", "{}")
+                    hist_content = files.get("history.json", {}).get("content", "[]")
+                    try:
+                        dz_list = json.loads(dz_content) if dz_content else []
+                    except Exception:
+                        dz_list = []
+                        logger.exception("Failed to parse dz.json from gist")
+                    try:
+                        dz_history = json.loads(hist_content) if hist_content else []
+                    except Exception:
+                        dz_history = []
+                        logger.exception("Failed to parse history.json from gist")
+                    logger.info("Loaded data from Gist")
+                    # write local copies
+                    _save_local()
+                    return
+                else:
+                    logger.warning("Gist GET returned %s", resp.status)
     except Exception:
-        pass
-    return default
+        logger.exception("Error loading from gist")
+    # fallback: load local
+    _load_local()
 
+async def save_to_gist():
+    """
+    Save current dz_list and dz_history into gist. On failure, write local backups.
+    """
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    payload = {
+        "files": {
+            "dz.json": {"content": json.dumps(dz_list, ensure_ascii=False, indent=2)},
+            "history.json": {"content": json.dumps(dz_history, ensure_ascii=False, indent=2)},
+        }
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.patch(url, headers=headers, json=payload, timeout=20) as resp:
+                if 200 <= resp.status < 300:
+                    logger.info("Saved data to gist successfully")
+                    _save_local()  # update local copy too
+                    return True
+                else:
+                    text = await resp.text()
+                    logger.warning("Failed to save to gist: %s %s", resp.status, text[:200])
+    except Exception:
+        logger.exception("Exception while saving to gist")
+    # fallback: save local as backup
+    _save_local(backup=True)
+    return False
 
-def load_data():
-    global dz_list, dz_history, user_cd, ras_cd
-    dz_list = load_json_if_exists(DATA_FILE, [])
-    dz_history = []  # will be loaded from gist
-    user_cd = load_json_if_exists(CD_FILE, {})
-    ras_cd = load_json_if_exists(RAS_CD_FILE, {})
-    load_history_from_gist()
+def _load_local():
+    global dz_list, dz_history
+    try:
+        if DZ_LOCAL.exists():
+            with DZ_LOCAL.open("r", encoding="utf-8") as f:
+                dz_list = json.load(f)
+        else:
+            dz_list = []
+    except Exception:
+        dz_list = []
+        logger.exception("Failed to load local dz.json")
+    try:
+        if HISTORY_LOCAL.exists():
+            with HISTORY_LOCAL.open("r", encoding="utf-8") as f:
+                dz_history = json.load(f)
+        else:
+            dz_history = []
+    except Exception:
+        dz_history = []
+        logger.exception("Failed to load local history.json")
 
+def _save_local(backup: bool = False):
+    """
+    Save local files. If backup True, create timestamped backup.
+    """
+    try:
+        with DZ_LOCAL.open("w", encoding="utf-8") as f:
+            json.dump(dz_list, f, ensure_ascii=False, indent=2)
+        with HISTORY_LOCAL.open("w", encoding="utf-8") as f:
+            json.dump(dz_history, f, ensure_ascii=False, indent=2)
+        if backup:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            with (BACKUP_DIR / f"dz_{ts}.json").open("w", encoding="utf-8") as f:
+                json.dump(dz_list, f, ensure_ascii=False, indent=2)
+            with (BACKUP_DIR / f"history_{ts}.json").open("w", encoding="utf-8") as f:
+                json.dump(dz_history, f, ensure_ascii=False, indent=2)
+            # keep only last N backups
+            files = sorted(BACKUP_DIR.glob("dz_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for old in files[BACKUP_COUNT:]:
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        logger.exception("Failed to save local files")
 
-def save_all():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(dz_list, f, ensure_ascii=False, indent=2)
-    with open(CD_FILE, "w", encoding="utf-8") as f:
-        json.dump(user_cd, f, ensure_ascii=False, indent=2)
-    with open(RAS_CD_FILE, "w", encoding="utf-8") as f:
-        json.dump(ras_cd, f, ensure_ascii=False, indent=2)
-    save_history_to_gist()
-
-
-# ---------------- Helpers ----------------
-def normalize_subject(name: str):
+# ---------------- time & schedule helpers ----------------
+def normalize_subject(name: str) -> str:
     if not name:
         return name
     key = name.strip().lower()
-    return SUBJECT_ALIAS.get(key, name.strip())
+    return SUBJECT_ALIAS.get(key, name.strip().capitalize())
 
-
-def weekday_name_from_date(d: date):
-    wd = d.weekday()  # 0 Mon ... 6 Sun
-    if wd >= 5:
-        return None
-    return DAYS_ORDER[wd]
-
-
-def lesson_start_end(d: date, idx: int):
-    # idx 0..6
-    minutes = FIRST_LESSON_START_MIN
+def lesson_start_end_for_date(d: date, idx: int):
+    """
+    idx is 0-based lesson index (0..6)
+    returns (start_datetime, end_datetime) in TZ
+    """
+    minutes = FIRST_LESSON_START
     for i in range(idx):
         minutes += LESSON_DURATION
         minutes += LONG_BREAK if i == 2 else SHORT_BREAK
@@ -203,37 +262,37 @@ def lesson_start_end(d: date, idx: int):
     end = start + timedelta(minutes=LESSON_DURATION)
     return start, end
 
-
-def find_subject_positions_exact(subject_name):
-    """
-    Возвращает список (day_key, lesson_index) где предмет точно совпадает после нормализации.
-    """
-    res = []
-    norm = normalize_subject(subject_name).lower()
-    for day, lessons in SCHEDULE.items():
-        for idx, lesson in enumerate(lessons):
-            if norm == normalize_subject(lesson).lower():
-                res.append((day, idx))
-    return res
-
-
-def next_date_for_day(day_key, from_dt=None):
+def next_date_for_day_key(day_key: str, from_dt: Optional[datetime] = None) -> date:
     if from_dt is None:
         from_dt = datetime.now(TZ)
     today = from_dt.date()
+    cur_wd = from_dt.weekday()  # Mon=0
+    # our DAYS_ORDER index: 0..4
     target = DAYS_ORDER.index(day_key)
-    cur_wd = from_dt.weekday()
-    delta = (target - cur_wd) % 7
-    candidate = today + timedelta(days=delta)
+    # map cur_wd to 0..4: if weekend, treat as next Monday?
+    # We'll compute delta modulo 7
+    delta_days = (target - cur_wd) % 7
+    candidate = today + timedelta(days=delta_days)
     return candidate
 
-
-def assign_one(subject, task):
+def find_subject_positions_exact(subject_name: str):
     """
-    Находит ближайший урок (по дате/времени) для subject и возвращает запись:
-    {
-        subject, task, day, lesson_index, assigned_date (YYYY-MM-DD), end_iso (ISO TZ)
-    }
+    Return list of (day_key, lesson_idx) where normalized subject equals schedule item.
+    """
+    res = []
+    norm = normalize_subject(subject_name).lower()
+    for day_key, lessons in SCHEDULE.items():
+        for idx, lesson in enumerate(lessons):
+            if norm == normalize_subject(lesson).lower():
+                res.append((day_key, idx))
+    return res
+
+# ---------------- core logic: assign / add / remove / expire ----------------
+def assign_one(subject: str, task: str):
+    """
+    Create assignment record for subject and task:
+    - find nearest lesson occurrence
+    - return record or None if subject not found
     """
     now = datetime.now(TZ)
     positions = find_subject_positions_exact(subject)
@@ -241,176 +300,99 @@ def assign_one(subject, task):
         return None
     candidates = []
     for day_key, idx in positions:
-        candidate_date = next_date_for_day(day_key, now)
-        _, end_dt = lesson_start_end(candidate_date, idx)
-        # если тот же день и урок уже прошёл — берём через 7 дней
-        if day_key == weekday_name_from_date(now.date()) and now >= end_dt:
-            candidate_date += timedelta(days=7)
-            _, end_dt = lesson_start_end(candidate_date, idx)
-        candidates.append((end_dt, day_key, idx, candidate_date))
+        candidate_date = next_date_for_day_key(day_key, now)
+        start, end = lesson_start_end_for_date(candidate_date, idx)
+        if day_key == DAYS_ORDER[now.weekday()] and now >= end:
+            # if today and lesson already ended -> use next week
+            candidate_date = candidate_date + timedelta(days=7)
+            start, end = lesson_start_end_for_date(candidate_date, idx)
+        candidates.append((end, day_key, idx, candidate_date))
     candidates.sort(key=lambda x: x[0])
     end_dt, day_key, idx, assigned_date = candidates[0]
     record = {
         "subject": normalize_subject(subject),
-        "task": task,
+        "task": task.strip(),
         "day": day_key,
         "lesson_index": idx,
         "assigned_date": assigned_date.isoformat(),
-        "end_iso": end_dt.replace(tzinfo=TZ).isoformat(),
+        "end_iso": end_dt.isoformat()
     }
     return record
 
-
-def remove_expired():
+def remove_expired(auto_save: bool = True):
     """
-    Переносим авто-удаленные в историю.
+    Move expired records to history with reason 'auto', save
     """
+    global dz_list, dz_history
     now = datetime.now(TZ)
     removed = [r for r in dz_list if datetime.fromisoformat(r["end_iso"]) <= now]
-    for r in removed:
-        dz_history.append({**r, "removed_at": now.isoformat(), "reason": "auto"})
-    # keep only not expired
-    remaining = [r for r in dz_list if datetime.fromisoformat(r["end_iso"]) > now]
-    changed = len(remaining) != len(dz_list)
-    if changed:
-        dz_list[:] = remaining
-        save_all()
+    if removed:
+        for r in removed:
+            dz_history.append({**r, "removed_at": now.isoformat(), "reason": "auto"})
+        dz_list[:] = [r for r in dz_list if datetime.fromisoformat(r["end_iso"]) > now]
+        _save_local()
+        # try save to gist asynchronously: caller will handle awaiting save_to_gist
+        return True
+    return False
 
-
-def emoji_for_subject(subject: str):
-    key = subject.lower()
-    for k, em in EMOJI_MAP.items():
-        if k in key:
+# ---------------- formatting ----------------
+def emoji_for_subject(subject: str) -> str:
+    k = subject.lower()
+    for key, em in EMOJI_MAP.items():
+        if key in k:
             return em
     return "📚"
 
+def format_timedelta_short(td: timedelta) -> str:
+    s = int(td.total_seconds())
+    if s <= 0:
+        return "0м"
+    h = s // 3600
+    m = (s % 3600) // 60
+    if h > 0:
+        return f"{h}ч {m}м" if m > 0 else f"{h}ч"
+    return f"{m}м"
 
-def format_time(dt_iso: str):
-    try:
-        dt = datetime.fromisoformat(dt_iso)
-        return dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return dt_iso
-
-
-def parse_lines_remove_day_time(lines):
+def format_dz_for_display_text():
     """
-    Принимаем список строк. Возвращаем отфильтрованный список,
-    где удалены явные метки дней недели и времени в начале строки.
-    Например:
-      'Пн 08:30 Русский - п 14' -> 'Русский - п 14'
+    Build pretty text for /dz
     """
-    out = []
-    day_names = ["пн", "пн.", "понедельник", "вт", "вт.", "вторник",
-                 "ср", "ср.", "среда", "чт", "чт.", "четверг",
-                 "пт", "пт.", "пятница", "суббота", "вс", "вс."]
-    time_pattern = re.compile(r"^\s*(\d{1,2}[:.]\d{2})")
-    day_pattern = re.compile(r"^\s*([A-Za-zА-Яа-яёЁ\.\-]+)\s*", re.UNICODE)
-    for line in lines:
-        original = line.strip()
-        if not original:
-            continue
-        # удалим в начале "Вт:" или "Вт" и времена "08:30"
-        s = original
-        # remove time at start
-        s = re.sub(r'^\s*\d{1,2}[:.]\d{2}\s*', "", s)
-        # remove day names at start (case-insensitive)
-        first_word = s.split()[0].lower() if s.split() else ""
-        if first_word.rstrip(":").lower() in day_names:
-            s = " ".join(s.split()[1:])  # drop first token
-        # if after trimming there is still time token at start, drop it
-        s = re.sub(r'^\s*\d{1,2}[:.]\d{2}\s*', "", s)
-        out.append(s.strip())
-    return out
-
-
-# ---------------- Cooldown helpers ----------------
-def cooldown_check_map(map_obj, user_id):
-    now = datetime.now(TZ)
-    if str(user_id) not in map_obj:
-        return True, None
-    last = None
-    try:
-        last = datetime.fromisoformat(map_obj[str(user_id)])
-    except Exception:
-        return True, None
-    remaining = timedelta(hours=COOLDOWN_HOURS) - (now - last)
-    if remaining.total_seconds() > 0:
-        return False, remaining
-    return True, None
-
-
-def update_cd_map(map_obj, user_id):
-    map_obj[str(user_id)] = datetime.now(TZ).isoformat()
-    save_all()
-
-
-def format_timedelta(td: timedelta):
-    # Выводит в человекочитаемом виде (Hч Mм)
-    secs = int(td.total_seconds())
-    if secs <= 0:
-        return "0s"
-    parts = []
-    days, secs = divmod(secs, 86400)
-    hours, secs = divmod(secs, 3600)
-    minutes, seconds = divmod(secs, 60)
-    if days:
-        parts.append(f"{days}д")
-    if hours:
-        parts.append(f"{hours}ч")
-    if minutes:
-        parts.append(f"{minutes}м")
-    if seconds and not parts:
-        parts.append(f"{seconds}s")
-    return " ".join(parts)
-
-
-# ---------------- Formatting output ----------------
-def format_dz_for_display():
-    remove_expired()
+    remove_expired(auto_save=False)
     if not dz_list:
         return "🗒 Домашек нет — всё чисто."
-
+    # group by day
     grouped = {}
     for r in dz_list:
         grouped.setdefault(r["day"], []).append(r)
-
-    text_lines = ["📚 ДОМАШНИЕ ЗАДАНИЯ", ""]
+    lines = ["📚 *ДОМАШНИЕ ЗАДАНИЯ*", ""]
     for day in DAYS_ORDER:
         if day not in grouped:
             continue
-        header = f"🗓 {day.upper()}"
-        text_lines.append(header)
-        # sort by lesson index
+        lines.append(f"🗓 *{day.upper()}*")
         lessons = sorted(grouped[day], key=lambda x: x["lesson_index"])
         for r in lessons:
             subj = r["subject"]
             task = r["task"]
             emoji = emoji_for_subject(subj)
-            # one block per lesson
-            text_lines.append(f"▫️ **{subj}** {emoji}")
-            # quoted line(s) — if multi-line, keep indentation
-            for tline in task.split("\n"):
-                tline = tline.strip()
-                if not tline:
-                    continue
-                text_lines.append(f"> {tline}")
-            text_lines.append("")  # blank between lessons
-        text_lines.append("─ ─ ─")
-    # remove trailing separator
-    if text_lines and text_lines[-1] == "─ ─ ─":
-        text_lines.pop()
-    return "\n".join(text_lines)
+            lines.append(f"▫️ *{subj}* {emoji}")
+            # split task to multiple lines if long
+            for t in str(task).split("\n"):
+                if t.strip():
+                    lines.append(f"> {t.strip()}")
+            # optional: show end time
+            # end_str = datetime.fromisoformat(r['end_iso']).astimezone(TZ).strftime("%Y-%m-%d %H:%M")
+            # lines.append(f"_кончится: {end_str}_")
+            lines.append("")  # blank between lessons
+        lines.append("─ ─ ─")
+    # remove last separator
+    if lines and lines[-1] == "─ ─ ─":
+        lines.pop()
+    return "\n".join(lines)
 
-
-def format_schedule_no_dz():
-    """
-    Форматирование расписания на неделю без дз (для /ras).
-    Показываем только предметы по урокам, пронумерованные 1..7.
-    """
-    lines = ["📅 РАСПИСАНИЕ НА НЕДЕЛЮ\n"]
+def format_schedule_text():
+    lines = ["📘 *РАСПИСАНИЕ НА НЕДЕЛЮ*", ""]
     for day in DAYS_ORDER:
-        lines.append(f"📆 {day.upper()}")
+        lines.append(f"🗓 *{day.upper()}*")
         lessons = SCHEDULE.get(day, [])
         for i, subj in enumerate(lessons, start=1):
             lines.append(f"{i}. {subj}")
@@ -419,136 +401,145 @@ def format_schedule_no_dz():
         lines.pop()
     return "\n".join(lines)
 
-
-# ---------------- Message processing (plain text adds) ----------------
-async def process_plain_text_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------- parsing admin input ----------------
+def strip_day_time_prefix(line: str) -> str:
     """
-    Админ может просто отправлять текст с несколькими строками:
-    'Русский - п14\nФизика - упр 5'
-    Бот обработает каждую строку.
+    Remove leading day words or times like 'Пн 08:30' from a line.
     """
-    if update.effective_user.id != ADMIN_ID:
-        # we don't auto-add from non-admins
-        return
+    s = line.strip()
+    # remove leading time
+    s = re.sub(r'^\s*\d{1,2}[:.]\d{2}\s*', "", s)
+    # remove day tokens
+    tokens = s.split()
+    if tokens:
+        first = tokens[0].lower().strip(":,")
+        if first in DAY_WORDS:
+            s = " ".join(tokens[1:])
+    # remove time again if any
+    s = re.sub(r'^\s*\d{1,2}[:.]\d{2}\s*', "", s)
+    return s.strip()
 
-    text = update.message.text or ""
-    # split into lines and remove leading /add_dz if present
-    # support both: sending message starting with /add_dz and then lines, and direct multi-line
-    if text.startswith("/add_dz"):
-        # remove first line
-        lines = text.splitlines()[1:]
-    else:
-        lines = text.splitlines()
-    # clean lines: remove day/time tokens at start
-    lines = parse_lines_remove_day_time(lines)
-    if not lines:
-        await update.message.reply_text("Не нашёл строк с форматом 'Предмет - ДЗ'.")
-        return
-
-    load_data()
+async def process_add_lines(lines: List[str]):
+    """
+    lines: list of strings in format 'Subject - task' OR lines continuing previous task.
+    This function returns list of added subjects (for messages), and saves to dz_list & history.
+    """
+    global last_subject_for_admin
     added = []
-    skipped_same = []
     warnings = []
-    for line in lines:
-        if "-" not in line:
+    for raw in lines:
+        s = strip_day_time_prefix(raw)
+        if not s:
             continue
-        subj_raw, task_raw = map(str.strip, line.split("-", 1))
+        # if no '-' but we have last_subject_for_admin -> treat as continuation of last task
+        if "-" not in s:
+            if last_subject_for_admin and added:
+                # append to last added item's task
+                last_rec = added[-1]
+                # find last record in dz_list for that subject assigned_date
+                subj = last_subject_for_admin
+                # append continuation to last dz_list entry with that subject
+                # find most recent assignment for subject
+                candidates = [r for r in dz_list if normalize_subject(r["subject"]).lower() == normalize_subject(subj).lower()]
+                if candidates:
+                    candidates = sorted(candidates, key=lambda x: x.get("assigned_date",""), reverse=True)
+                    candidates[0]["task"] = candidates[0]["task"] + " " + s
+                else:
+                    warnings.append(f"Нет предыдущего предмета для добавления продолжения: '{s}'")
+            else:
+                warnings.append(f"Строка пропущена (нет '-' и нет last_subject): {raw}")
+            continue
+        subj_raw, task_raw = map(str.strip, s.split("-", 1))
         subj_norm = normalize_subject(subj_raw)
-        task = " ".join(task_raw.split())  # normalize spaces, keep text
-        # attempt to assign
-        record = assign_one(subj_norm, task)
-        if record is None:
-            warnings.append(f"Не найден предмет в расписании: '{subj_raw}'")
+        last_subject_for_admin = subj_norm
+        rec = assign_one(subj_norm, task_raw)
+        if rec is None:
+            warnings.append(f"Предмет '{subj_raw}' не найден в расписании — пропущено.")
             continue
-        # check if already exists for same assigned_date
-        exists_same = None
-        exists_diff = None
-        for r in dz_list:
-            if normalize_subject(r["subject"]).lower() == subj_norm.lower():
-                # if assigned_date matches candidate
-                if r["assigned_date"] == record["assigned_date"]:
-                    if r["task"].strip() == task.strip():
-                        exists_same = r
-                    else:
-                        exists_diff = r
-        if exists_same:
-            skipped_same.append(subj_norm)
-            continue
-        if exists_diff:
-            # don't overwrite automatically. notify admin
-            warnings.append(
-                f"⚠️ По предмету '{subj_norm}' уже есть другое ДЗ на ближайший урок ({exists_diff['assigned_date']}).\n"
-                f"Существующее: {exists_diff['task']}\nОтправленное: {task}"
-            )
-            continue
-        # add
-        dz_list.append(record)
-        added.append(f"{subj_norm} ({record['assigned_date']})")
-    if added:
-        save_all()
-    # prepare response
-    parts = []
-    if added:
-        parts.append("✅ Добавлено:\n" + "\n".join(added))
-    if skipped_same:
-        parts.append("ℹ️ Пропущено (уже есть, совпадает):\n" + ", ".join(skipped_same))
-    if warnings:
-        parts.append("\n".join(warnings))
-    reply = "\n\n".join(parts) if parts else "Ничего не добавлено."
-    await update.message.reply_text(reply)
-
+        # check duplicates on same assigned_date & subject
+        exists = next((r for r in dz_list if normalize_subject(r["subject"]).lower() == normalize_subject(rec["subject"]).lower() and r["assigned_date"] == rec["assigned_date"]), None)
+        if exists:
+            if exists["task"].strip() == rec["task"].strip():
+                # exact duplicate -> skip
+                continue
+            else:
+                warnings.append(f"По предмету {rec['subject']} уже есть другое ДЗ на {rec['assigned_date']}.")
+                continue
+        dz_list.append(rec)
+        dz_history.append({**rec, "added_at": datetime.now(TZ).isoformat(), "reason": "added"})
+        added.append(f"{rec['subject']} ({rec['assigned_date']})")
+    # save local & gist
+    _save_local()
+    await save_to_gist()
+    return added, warnings
 
 # ---------------- Command handlers ----------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👋 Привет! Я бот для домашки класса 7.1\n\n"
-        "Создатель и непосредвенный администратор -  @uwu4950"
-        "По всем вопросам пишите. доступные команнды:
-        "/dz (посмотреть задания)"
-        "/ras (рассписание)"
+    await update.message.reply_text(
+        "Привет! Я бот для ДЗ.\nКоманды: /add_dz (админ), /dz, /ras, /clear (админ), /remove_dz <предмет> (админ), /history, /find <предмет>, /short"
     )
-    зawait update.message.reply_text(msg)
-
 
 async def cmd_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    load_data()
-    ok, rem = cooldown_check_map(user_cd, update.effective_user.id)
-    if update.effective_user.id != ADMIN_ID and not ok:
-        await update.message.reply_text(f"⏳ Подождите {format_timedelta(rem)} до следующего запроса /dz.")
-        return
+    # cooldown per user for /dz except admin
+    uid = str(update.effective_user.id)
+    now = datetime.now(TZ)
     if update.effective_user.id != ADMIN_ID:
-        update_cd_map(user_cd, update.effective_user.id)
-    text = format_dz_for_display()
-    await update.message.reply_text(text, parse_mode="Markdown")
-
+        last = user_cd.get(uid)
+        if last:
+            last_dt = datetime.fromisoformat(last)
+            rem = timedelta(hours=COOLDOWN_HOURS) - (now - last_dt)
+            if rem.total_seconds() > 0:
+                await update.message.reply_text(f"⏳ У вас кд на /dz: {format_timedelta_short(rem)}")
+                return
+        user_cd[uid] = now.isoformat()
+        _save_local()
+    # remove expired and save if any removed
+    if remove_expired():
+        # try to persist expired removals
+        await save_to_gist()
+    text = format_dz_for_display_text()
+    await update.message.reply_markdown(text)
 
 async def cmd_ras(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    load_data()
-    ok, rem = cooldown_check_map(ras_cd, update.effective_user.id)
-    if not ok:
-        await update.message.reply_text(f"⏳ Подождите {format_timedelta(rem)} до следующего запроса /ras.")
-        return
-    update_cd_map(ras_cd, update.effective_user.id)
-    await update.message.reply_text(format_schedule_no_dz())
-
+    uid = str(update.effective_user.id)
+    now = datetime.now(TZ)
+    last = ras_cd.get(uid)
+    if last:
+        last_dt = datetime.fromisoformat(last)
+        rem = timedelta(hours=COOLDOWN_HOURS) - (now - last_dt)
+        if rem.total_seconds() > 0:
+            await update.message.reply_text(f"⏳ У вас кд на /ras: {format_timedelta_short(rem)}")
+            return
+    ras_cd[uid] = now.isoformat()
+    _save_local()
+    text = format_schedule_text()
+    await update.message.reply_markdown(text)
 
 async def cmd_add_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # admin-only convenience: single-line
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Только админ может добавлять ДЗ.")
         return
-    # rest of text after command
-    text = " ".join(context.args)
-    if not text:
-        await update.message.reply_text("Использование: /add_dz Предмет - ДЗ")
-        return
-    # use same parsing as plain text (single-line)
-    lines = [text]
-    lines = parse_lines_remove_day_time(lines)
-    # reuse processing logic
-    update.message.text = "\n".join(lines)
-    await process_plain_text_add(update, context)
-
+    # text after command: may be multiline in update.message.text
+    full = update.message.text or ""
+    lines = []
+    if "\n" in full:
+        lines = full.splitlines()[1:]  # skip command line
+    else:
+        # single line: args used
+        args_text = " ".join(context.args) if context.args else ""
+        if not args_text:
+            await update.message.reply_text("Использование: /add_dz <Subject - task> или отправь многострочный сообщение.")
+            return
+        lines = [args_text]
+    added, warnings = await process_add_lines(lines)
+    reply_parts = []
+    if added:
+        reply_parts.append("✅ Добавлено:\n" + "\n".join(added))
+    if warnings:
+        reply_parts.append("⚠️ Предупреждения:\n" + "\n".join(warnings))
+    if not reply_parts:
+        reply_parts = ["Ни одного задания не добавлено."]
+    await update.message.reply_text("\n\n".join(reply_parts))
 
 async def cmd_remove_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -559,81 +550,158 @@ async def cmd_remove_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /remove_dz <предмет>")
         return
     subj_norm = normalize_subject(subj)
-    load_data()
-    removed = [r for r in dz_list if normalize_subject(r["subject"]).lower() == subj_norm.lower()]
-    if not removed:
-        await update.message.reply_text("Такого предмета нет в текущих ДЗ.")
-        return
-    now = datetime.now(TZ)
-    for r in removed:
-        dz_history.append({**r, "removed_at": now.isoformat(), "reason": "manual"})
-    dz_list[:] = [r for r in dz_list if normalize_subject(r["subject"]).lower() != subj_norm.lower()]
-    save_all()
-    await update.message.reply_text(f"✅ Удалено {len(removed)} ДЗ по предмету {subj_norm}.")
-
+    load_before = len(dz_list)
+    now_iso = datetime.now(TZ).isoformat()
+    removed = []
+    remaining = []
+    for r in dz_list:
+        if normalize_subject(r["subject"]).lower() == subj_norm.lower():
+            dz_history.append({**r, "removed_at": now_iso, "reason": "manual_remove"})
+            removed.append(r)
+        else:
+            remaining.append(r)
+    dz_list[:] = remaining
+    if removed:
+        _save_local()
+        await save_to_gist()
+        await update.message.reply_text(f"✅ Удалено {len(removed)} ДЗ по {subj_norm}")
+    else:
+        await update.message.reply_text("Ничего не найдено для удаления.")
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Только админ может очищать все ДЗ.")
         return
-    load_data()
     if not dz_list:
         await update.message.reply_text("Список ДЗ уже пуст.")
         return
-    now = datetime.now(TZ)
+    now_iso = datetime.now(TZ).isoformat()
     for r in dz_list:
-        dz_history.append({**r, "removed_at": now.isoformat(), "reason": "manual_clear"})
+        dz_history.append({**r, "removed_at": now_iso, "reason": "manual_clear"})
     count = len(dz_list)
     dz_list.clear()
-    save_all()
+    _save_local()
+    await save_to_gist()
     await update.message.reply_text(f"🧹 Очищено {count} ДЗ и сохранено в истории.")
 
-
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    load_data()
+    # load latest from gist to be sure
+    await load_from_gist()
     if not dz_history:
-        await update.message.reply_text("Истории удалённых ДЗ пока нет.")
+        await update.message.reply_text("История удалённых ДЗ пуста.")
         return
     # show last 50 entries
     items = dz_history[-50:]
     lines = []
     for r in reversed(items):
-        removed_at = r.get("removed_at", "")[:16]
+        removed = r.get("removed_at", r.get("added_at", ""))[:16]
         subj = r.get("subject", "")
-        task = r.get("task", "")
+        task = r.get("task", r.get("task", r.get("hw","")))
         reason = r.get("reason", "")
-        lines.append(f"{removed_at} | {subj} | {task} [{reason}]")
-    # send in chunks if too long
+        lines.append(f"{removed} | {subj} | {task} [{reason}]")
+    # send in chunks
     chunk_size = 4000
     msg = "\n".join(lines)
     for i in range(0, len(msg), chunk_size):
-        await update.message.reply_text(msg[i : i + chunk_size])
+        await update.message.reply_text(msg[i:i+chunk_size])
 
+async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: /find <предмет>")
+        return
+    subj = normalize_subject(" ".join(context.args))
+    results = [r for r in dz_list if normalize_subject(r["subject"]).lower() == subj.lower()]
+    if not results:
+        await update.message.reply_text("ДЗ по этому предмету не найдены.")
+        return
+    lines = [f"▫️ *{r['subject']}* ({r['assigned_date']})\n> {r['task']}\n" for r in sorted(results, key=lambda x: x['assigned_date'])]
+    await update.message.reply_markdown("\n".join(lines))
 
-# ---------------- Message handler for free text ----------------
+async def cmd_short(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not dz_list:
+        await update.message.reply_text("Домашек нет.")
+        return
+    subjects = sorted({r["subject"] for r in dz_list})
+    await update.message.reply_text("📚 Сегодня есть ДЗ по:\n" + ", ".join(subjects))
+
+async def cmd_edit_dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Только админ может редактировать.")
+        return
+    text = " ".join(context.args)
+    if "-" not in text:
+        await update.message.reply_text("Использование: /edit_dz <предмет> - <новое дз>")
+        return
+    subj_raw, task = map(str.strip, text.split("-",1))
+    subj = normalize_subject(subj_raw)
+    # find most recent assignment for subject
+    candidates = [r for r in dz_list if normalize_subject(r["subject"]).lower() == subj.lower()]
+    if not candidates:
+        await update.message.reply_text("Такого предмета нет в текущих ДЗ.")
+        return
+    # edit the most recent by assigned_date
+    candidates = sorted(candidates, key=lambda x: x["assigned_date"], reverse=True)
+    rec = candidates[0]
+    rec["task"] = task
+    dz_history.append({**rec, "edited_at": datetime.now(TZ).isoformat(), "reason": "edited", "new_task": task})
+    _save_local()
+    await save_to_gist()
+    await update.message.reply_text(f"✅ ДЗ по {subj} обновлено.")
+
+# ---------------- message handler for free text ----------------
 async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Если админ присылает текст с '-' — обрабатываем как добавление.
-    В остальных случаях — игнорируем (пользователи не могут добавлять).
+    If admin sends plain text containing '-' treat as add lines.
+    Otherwise ignore (non-admin cannot add).
     """
-    txt = update.message.text or ""
-    # quick guard: if message contains '-' treat as potential dz
-    if "-" not in txt:
+    text = update.message.text or ""
+    if "-" not in text:
         return
-    # admin only
     if update.effective_user.id != ADMIN_ID:
-        # ignore messages from non-admin that look like dz
+        # ignore non-admin plain additions
         return
-    await process_plain_text_add(update, context)
+    # support both multi-line and single-line block
+    if text.startswith("/add_dz"):
+        lines = text.splitlines()[1:]
+    else:
+        lines = text.splitlines()
+    added, warnings = await process_add_lines(lines)
+    resp = []
+    if added:
+        resp.append("✅ Добавлено:\n" + "\n".join(added))
+    if warnings:
+        resp.append("⚠️ Предупреждения:\n" + "\n".join(warnings))
+    if not resp:
+        resp = ["Ничего не добавлено."]
+    await update.message.reply_text("\n\n".join(resp))
 
+# ---------------- background task for periodic cleanup ----------------
+async def periodic_cleanup_task(app):
+    while True:
+        try:
+            changed = remove_expired(auto_save=False)
+            if changed:
+                # persist removals
+                await save_to_gist()
+            await asyncio.sleep(300)  # every 5 minutes
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("Error in periodic cleanup")
+            await asyncio.sleep(60)
 
-# ---------------- Startup ----------------
-def main():
-    load_data()
-    # ensure tz usage by converting stored iso strings? handled on access
+# ---------------- startup ----------------
+async def main():
+    # load initial data
+    await load_from_gist()
+    # ensure local files updated
+    _save_local()
+    # cleanup expired at start
+    if remove_expired(auto_save=False):
+        await save_to_gist()
+    # build app
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("dz", cmd_dz))
     app.add_handler(CommandHandler("ras", cmd_ras))
@@ -641,13 +709,20 @@ def main():
     app.add_handler(CommandHandler("remove_dz", cmd_remove_dz))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("find", cmd_find))
+    app.add_handler(CommandHandler("short", cmd_short))
+    app.add_handler(CommandHandler("edit_dz", cmd_edit_dz))
 
-    # message handler: plain text (admin adding)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
 
-    print("✅ Bot started")
-    app.run_polling()
-
+    # start periodic cleanup task
+    task = asyncio.create_task(periodic_cleanup_task(app))
+    logger.info("Bot started")
+    try:
+        await app.run_polling()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
