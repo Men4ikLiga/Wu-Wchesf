@@ -725,4 +725,16 @@ async def main():
         await asyncio.gather(task, return_exceptions=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import asyncio
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # если Railway уже запустил event loop — просто запускаем задачу
+            loop.create_task(main())
+        else:
+            loop.run_until_complete(main())
+    except RuntimeError:
+        # fallback на случай, если луп не существует
+        asyncio.run(main())
+
