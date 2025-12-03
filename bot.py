@@ -1,13 +1,16 @@
+# bot_v1_full.py — Part 1/3
 import asyncio
 import sqlite3
 import datetime
 import os
 import logging
+import difflib
 from typing import List, Dict, Optional, Tuple
+
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ============================ НАСТРОЙКА ЛОГГИРОВАНИЯ ============================
+# ============================ ЛОГИРОВАНИЕ ============================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -19,9 +22,16 @@ ADMIN_ID = 6193109213
 DZ_COOLDOWN = 4 * 60 * 60
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 
-# ============================ УМНЫЙ ПАРСЕР ТЕКСТА ============================
+# ============================ УМНЫЙ ПАРСЕР ТЕКСТА (С AUTO-CORRECT) ============================
 class SmartHomeworkParser:
+    """
+    Улучшенный парсер:
+    - разбирает тексты в формате 'Предмет - задание', 'Предмет: задание', 'Предмет задание'
+    - поддерживает многострочный ввод
+    - умеет исправлять опечатки в названиях предметов с помощью fuzzy matching
+    """
     def __init__(self):
+        # Базовые ключевые слова — взяты из твоего списка, можно расширять
         self.subject_keywords = {
             'математика': ['математика', 'матем', 'мат', 'math'],
             'алгебра': ['алгебра', 'алг'],
@@ -60,18 +70,26 @@ class SmartHomeworkParser:
             'французский язык': ['французский', 'франц'],
             'проект': ['проект', 'проектная деятельность']
         }
+        # Список "мастер-имен" предметов (ключи словаря) для fuzzy matching
+        self.master_subjects = list(self.subject_keywords.keys())
 
     def parse_any_format(self, text: str) -> List[Tuple[str, str]]:
-        homework_list = []
+        """
+        Парсит произвольный текст и возвращает список (subject, task_text).
+        Работает с многострочными вводами.
+        """
+        homework_list: List[Tuple[str, str]] = []
         lines = text.split('\n')
         current_subject = None
-        homework_lines = []
+        homework_lines: List[str] = []
+
         for line in lines:
             line = line.strip()
             if not line:
                 continue
             subject_in_line = self._find_subject_in_line(line)
             if subject_in_line:
+                # Если был предыдущий предмет — сохранить его
                 if current_subject and homework_lines:
                     homework_text = ' '.join(homework_lines).strip()
                     if homework_text:
@@ -83,40 +101,124 @@ class SmartHomeworkParser:
                     homework_lines.append(homework_part)
             elif current_subject:
                 homework_lines.append(line)
+            else:
+                # Попытка парсить "Предмет Задание" в одной строке без разделителя
+                maybe_subject, maybe_task = self._split_subject_task_guess(line)
+                if maybe_subject:
+                    current_subject = maybe_subject
+                    homework_lines = [maybe_task] if maybe_task else []
+                else:
+                    # Если не нашли предмет — запоминаем как "неопределённый" (пропускаем)
+                    continue
+
+        # Финальный накопитель
         if current_subject and homework_lines:
             homework_text = ' '.join(homework_lines).strip()
             if homework_text:
                 homework_list.append((current_subject, homework_text))
+
         return homework_list
 
     def _find_subject_in_line(self, line: str) -> Optional[str]:
+        """
+        Ищет явный предмет в строке (по ключевым словам).
+        Возвращает normalized subject (ключ из master_subjects) или None.
+        """
         line_lower = line.lower()
+        # Проверяем ключевые слова
         for subject, keywords in self.subject_keywords.items():
             for keyword in keywords:
-                if (line_lower.startswith(keyword) or 
-                    f" {keyword} " in line_lower or 
-                    f" {keyword}:" in line_lower or
-                    f" {keyword}-" in line_lower):
+                keyword_lower = keyword.lower()
+                if (line_lower.startswith(keyword_lower) or
+                    f" {keyword_lower} " in line_lower or
+                    f"{keyword_lower}:" in line_lower or
+                    f"{keyword_lower}-" in line_lower):
+                    # нашли — вернём normalized subject
                     return subject
+        # Если не найдено явным образом, пробуем fuzzy match для слова в начале
+        first_word = line_lower.split()[0]
+        fm = self._fuzzy_match_subject(first_word)
+        if fm:
+            return fm
         return None
 
     def _extract_homework_from_line(self, line: str, subject: str) -> str:
+        """
+        Возвращает часть строки после ключевого слова предмета (задание).
+        Если явно не найдено — возвращает строку целиком.
+        """
         line_lower = line.lower()
-        for keyword in self.subject_keywords[subject]:
-            if line_lower.startswith(keyword):
-                return line[len(keyword):].strip(' :-\–')
-            subject_pos = line_lower.find(keyword)
-            if subject_pos != -1:
-                after_subject = line[subject_pos + len(keyword):].strip(' :-\–')
-                return after_subject
-        return line
+        # пытаемся найти одно из ключевых слов для этого предмета внутри строки
+        for keyword in self.subject_keywords.get(subject, []):
+            kl = keyword.lower()
+            if line_lower.startswith(kl):
+                return line[len(keyword):].strip(' :-–')
+            pos = line_lower.find(kl)
+            if pos != -1:
+                return line[pos + len(keyword):].strip(' :-–')
+        # если не нашли, убираем первое слово (возможно это предмет) и возвращаем остаток
+        parts = line.split(' ', 1)
+        if len(parts) == 2:
+            return parts[1].strip(' :-–')
+        return ''
+
+    def _split_subject_task_guess(self, line: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Попытка угадать предмет и задание в строке без разделителя:
+        например: "Алгебра номер 3.30" или "Алгбра 3.30"
+        """
+        words = line.split()
+        if not words:
+            return None, None
+        # Попробуем progressive prefix matching (1..3 слов)
+        for take in range(1, min(4, len(words)+1)):
+            candidate = ' '.join(words[:take])
+            fm = self._fuzzy_match_subject(candidate)
+            if fm:
+                rest = ' '.join(words[take:]).strip()
+                return fm, rest
+        return None, None
+
+    def _fuzzy_match_subject(self, text: str) -> Optional[str]:
+        """
+        Пытаемся найти ближайший предмет к тексту (fuzzy matching).
+        Возвращаем предмет из master_subjects при уверенном совпадении.
+        Порог можно настроить.
+        """
+        # Проверяем точное совпадение с ключевыми словами
+        t = text.lower()
+        for subject, keywords in self.subject_keywords.items():
+            if t == subject.lower():
+                return subject
+            for kw in keywords:
+                if t == kw.lower():
+                    return subject
+
+        # Теперь fuzzy match по именам предметов и ключевым словам
+        candidates = self.master_subjects + [kw for kws in self.subject_keywords.values() for kw in kws]
+        # Используем difflib.get_close_matches
+        close = difflib.get_close_matches(t, candidates, n=1, cutoff=0.75)
+        if close:
+            found = close[0]
+            # нужно вернуть normalized subject (ключ) для найденного слова
+            for subject, keywords in self.subject_keywords.items():
+                if found == subject or found in keywords:
+                    return subject
+        # Попробуем более слабый порог
+        close2 = difflib.get_close_matches(t, candidates, n=1, cutoff=0.6)
+        if close2:
+            found = close2[0]
+            for subject, keywords in self.subject_keywords.items():
+                if found == subject or found in keywords:
+                    return subject
+        return None
 
 # ============================ БАЗА ДАННЫХ ============================
 class Database:
-    def __init__(self):
-        self.conn = sqlite3.connect('school_bot.db', check_same_thread=False)
+    def __init__(self, db_path: str = 'school_bot.db'):
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.create_tables()
-    
+
     def create_tables(self):
         self.conn.execute('''
             CREATE TABLE IF NOT EXISTS bound_groups (
@@ -153,25 +255,25 @@ class Database:
             )
         ''')
         self.conn.commit()
-    
+
     def add_bound_group(self, group_id: int) -> bool:
         try:
             self.conn.execute('INSERT OR REPLACE INTO bound_groups (group_id) VALUES (?)', (group_id,))
             self.conn.commit()
             return True
         except sqlite3.Error as e:
-            logger.error(f"Ошибка базы данных при добавлении группы: {e}")
+            logger.error(f"DB error add_bound_group: {e}")
             return False
-    
+
     def get_bound_group(self) -> Optional[int]:
         try:
             cursor = self.conn.execute('SELECT group_id FROM bound_groups LIMIT 1')
-            result = cursor.fetchone()
-            return result[0] if result else None
+            row = cursor.fetchone()
+            return row[0] if row else None
         except sqlite3.Error as e:
-            logger.error(f"Ошибка базы данных при получении группы: {e}")
+            logger.error(f"DB error get_bound_group: {e}")
             return None
-    
+
     def add_homework(self, subject: str, task_text: str, lesson_time: str, due_date: str, photo_file_id: str = None) -> bool:
         try:
             self.conn.execute(
@@ -181,9 +283,9 @@ class Database:
             self.conn.commit()
             return True
         except sqlite3.Error as e:
-            logger.error(f"Ошибка базы данных при добавлении ДЗ: {e}")
+            logger.error(f"DB error add_homework: {e}")
             return False
-    
+
     def get_current_homework(self) -> List[tuple]:
         try:
             now = datetime.datetime.now()
@@ -208,13 +310,13 @@ class Database:
                 future_homework.extend(cursor.fetchall())
             return today_homework + future_homework
         except sqlite3.Error as e:
-            logger.error(f"Ошибка базы данных при получении ДЗ: {e}")
+            logger.error(f"DB error get_current_homework: {e}")
             return []
-    
+
     def _get_russian_day_name(self, weekday: int) -> str:
         days = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье']
         return days[weekday]
-    
+
     def cleanup_old_homework(self) -> List[str]:
         cleaned_subjects = []
         cleaned_photo_ids = []
@@ -243,21 +345,21 @@ class Database:
                     (now.strftime("%Y-%m-%d"), ', '.join(unique_subjects), photo_ids_str)
                 )
             self.conn.commit()
-            logger.info(f"Автоочистка ДЗ. Очищено: {len(cleaned_subjects)} предметов, {len(cleaned_photo_ids)} фото")
+            logger.info(f"Auto-cleanup: removed {len(cleaned_subjects)} subjects, {len(cleaned_photo_ids)} photos")
             return list(set(cleaned_subjects))
         except sqlite3.Error as e:
-            logger.error(f"Ошибка базы данных при очистке ДЗ: {e}")
+            logger.error(f"DB error cleanup_old_homework: {e}")
             return []
-    
+
     def clear_all_homework(self) -> bool:
         try:
             self.conn.execute('DELETE FROM homework')
             self.conn.commit()
             return True
         except sqlite3.Error as e:
-            logger.error(f"Ошибка базы данных при очистке всех ДЗ: {e}")
+            logger.error(f"DB error clear_all_homework: {e}")
             return False
-    
+
     def check_cooldown(self, user_id: int) -> Optional[str]:
         try:
             cursor = self.conn.execute('SELECT cooldown_until FROM cooldowns WHERE user_id = ?', (user_id,))
@@ -271,9 +373,9 @@ class Database:
                     return f"{hours}ч {minutes}м"
             return None
         except sqlite3.Error as e:
-            logger.error(f"Ошибка базы данных при проверке кд: {e}")
+            logger.error(f"DB error check_cooldown: {e}")
             return None
-    
+
     def set_cooldown(self, user_id: int) -> bool:
         try:
             cooldown_until = datetime.datetime.now() + datetime.timedelta(seconds=DZ_COOLDOWN)
@@ -281,12 +383,13 @@ class Database:
             self.conn.commit()
             return True
         except sqlite3.Error as e:
-            logger.error(f"Ошибка базы данных при установке кд: {e}")
+            logger.error(f"DB error set_cooldown: {e}")
             return False
 
 # ============================ МЕНЕДЖЕР РАСПИСАНИЯ ============================
 class ScheduleManager:
     def __init__(self):
+        # расписание аналогично твоему — оставил без изменений, можно править
         self.schedule = {
             'понедельник': [
                 {'number': 1, 'subject': 'Ров', 'time': '08:00-08:40'},
@@ -335,119 +438,12 @@ class ScheduleManager:
         }
         self.day_names = {
             'понедельник': 'ПОНЕДЕЛЬНИК',
-            'вторник': 'ВТОРНИК', 
+            'вторник': 'ВТОРНИК',
             'среда': 'СРЕДА',
             'четверг': 'ЧЕТВЕРГ',
             'пятница': 'ПЯТНИЦА'
         }
-    
-    def get_current_day(self) -> str:
-        days = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье']
-        return days[datetime.datetime.now().weekday()]
-    
-    def get_today_schedule(self) -> str:
-        today = self.get_current_day()
-        if today not in self.schedule:
-            return "📅 Сегодня уроков нет!"
-        schedule_text = f"📅 {self.day_names[today].upper()}:\n\n"
-        for lesson in self.schedule[today]:
-            schedule_text += f"{lesson['number']}. {lesson['subject']} ({lesson['time']})\n"
-        return schedule_text
-    
-    def get_next_lesson(self) -> str:
-        today = self.get_current_day()
-        if today not in self.schedule:
-            return "⏰ Сегодня уроков нет!"
-        now = datetime.datetime.now().time()
-        current_time = now.strftime("%H:%M")
-        for lesson in self.schedule[today]:
-            start_time = lesson['time'].split('-')[0]
-            if current_time < start_time:
-                time_until = self._calculate_time_until(start_time)
-                return f"⏰ Следующий урок:\n{lesson['subject']} ({lesson['time']})\nДо начала: {time_until}"
-        return "⏰ Уроки на сегодня закончились!"
-    
-    def _calculate_time_until(self, start_time: str) -> str:
-        now = datetime.datetime.now()
-        start = datetime.datetime.strptime(start_time, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
-        if start < now:
-            start += datetime.timedelta(days=1)
-        diff = start - now
-        hours = diff.seconds // 3600
-        minutes = (diff.seconds % 3600) // 60
-        if hours > 0:
-            return f"{hours}ч {minutes}м"
-        return f"{minutes} минут"
-    
-    def find_next_lesson(self, subject: str) -> Optional[Dict]:
-        today = self.get_current_day()
-        days_order = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница']
-        normalized_subject = self._normalize_subject_name(subject)
-        current_index = days_order.index(today) if today in days_order else 0
-        now = datetime.datetime.now().time()
-        current_time = now.strftime("%H:%M")
-        if today in self.schedule:
-            for lesson in self.schedule[today]:
-                if self._subject_matches(lesson['subject'], normalized_subject):
-                    lesson_start_time = lesson['time'].split('-')[0]
-                    if current_time < lesson_start_time:
-                        return {'day': today, 'time': lesson['time'], 'subject': lesson['subject']}
-        for i in range(1, 5):
-            next_day_index = (current_index + i) % 5
-            day = days_order[next_day_index]
-            if day in self.schedule:
-                for lesson in self.schedule[day]:
-                    if self._subject_matches(lesson['subject'], normalized_subject):
-                        return {'day': day, 'time': lesson['time'], 'subject': lesson['subject']}
-        if 'понедельник' in self.schedule:
-            for lesson in self.schedule['понедельник']:
-                if self._subject_matches(lesson['subject'], normalized_subject):
-                    return {'day': 'понедельник', 'time': lesson['time'], 'subject': lesson['subject']}
-        return None
-
-    def _normalize_subject_name(self, subject: str) -> str:
-        subject_lower = subject.lower()
-        mappings = {
-            'труд': 'технология',
-            'физра': 'физкультура',
-            'физ-ра': 'физкультура',
-            'английский': 'английский язык',
-            'литра': 'литература',
-            'изо': 'изобразительное искусство',
-            'информатика и икт': 'информатика',
-            'тв': 'твис',
-            'финграм': 'офг',
-            'основы финансовой грамотности': 'офг',
-            'разговоры о важном': 'ров',
-            'русский родной': 'рмг'
-        }
-        return mappings.get(subject_lower, subject_lower)
-
-    def _subject_matches(self, schedule_subject: str, user_subject: str) -> bool:
-        schedule_clean = schedule_subject.lower()
-        user_clean = user_subject.lower()
-        if schedule_clean == user_clean:
-            return True
-        if user_clean in schedule_clean or schedule_clean in user_clean:
-            return True
-        special_matches = {
-            'технология': ['труд'],
-            'физкультура': ['физра', 'физ-ра'],
-            'английский язык': ['английский'],
-            'литература': ['литра'],
-            'изобразительное искусство': ['изо'],
-            'информатика': ['информатика и икт'],
-            'твис': ['тв'],
-            'офг': ['финграм', 'основы финансовой грамотности'],
-            'ров': ['разговоры о важном'],
-            'рмг': ['русский родной']
-        }
-        for main_subject, variants in special_matches.items():
-            if (schedule_clean == main_subject and user_clean in variants) or (user_clean == main_subject and schedule_clean in variants):
-                return True
-        return False
-
-# ============================ ОСНОВНОЙ КЛАСС БОТА ============================
+# bot_v1_full.py — Part 2/3 (продолжение)
 class SchoolBot:
     def __init__(self, token: str):
         self.token = token
@@ -457,7 +453,7 @@ class SchoolBot:
         self.application = Application.builder().token(token).build()
         self._setup_handlers()
         self._setup_cleanup_task()
-    
+
     def _setup_handlers(self):
         handlers = [
             CommandHandler("start", self.start_command),
@@ -475,7 +471,7 @@ class SchoolBot:
         ]
         for handler in handlers:
             self.application.add_handler(handler)
-    
+
     def _setup_cleanup_task(self):
         try:
             if hasattr(self.application, 'job_queue') and self.application.job_queue:
@@ -497,16 +493,18 @@ class SchoolBot:
                                 logger.error(f"Ошибка отправки отчета админу: {e}")
                     except Exception as e:
                         logger.error(f"Ошибка в задаче очистки: {e}")
+                # Запуск каждый день в 18:00
                 self.application.job_queue.run_daily(cleanup_and_notify, time=datetime.time(hour=18, minute=0, second=0), name="daily_cleanup")
-                logger.info("✅ JobQueue настроен для ежедневной очистки ДЗ")
+                logger.info("JobQueue настроен для ежедневной очистки ДЗ")
             else:
-                logger.warning("⚠️ JobQueue недоступен. Ежедневная очистка не будет работать автоматически.")
+                logger.warning("JobQueue недоступен — ежедневная очистка не будет работать.")
         except Exception as e:
-            logger.error(f"❌ Ошибка настройки JobQueue: {e}")
-    
+            logger.error(f"Ошибка настройки JobQueue: {e}")
+
     def is_admin(self, user_id: int) -> bool:
         return user_id == ADMIN_ID
-    
+
+    # ---------------- Команды ----------------
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if update.effective_chat.type == "private" and not self.is_admin(user_id):
@@ -517,7 +515,7 @@ class SchoolBot:
             keyboard.append(["➕ Добавить ДЗ", "📄 Спарсить ДЗ"])
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         await update.message.reply_text("🤖 Школьный Органайзер\n\nВыберите действие из меню ниже:", reply_markup=reply_markup)
-    
+
     async def bind_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_admin(update.effective_user.id):
             await update.message.reply_text("❌ У вас нет прав для этой команды.")
@@ -530,7 +528,7 @@ class SchoolBot:
             await update.message.reply_text("✅ Бот успешно привязан к этой группе!")
         else:
             await update.message.reply_text("❌ Ошибка при привязке бота!")
-    
+
     async def all_post_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_admin(update.effective_user.id):
             await update.message.reply_text("❌ У вас нет прав для этой команды.")
@@ -544,7 +542,7 @@ class SchoolBot:
         post_text = " ".join(context.args)
         context.user_data['pending_all_post'] = {'text': post_text, 'user_id': update.effective_user.id}
         await update.message.reply_text("✅ Сообщение сохранено! Теперь перейди в групповой чат и напиши команду /confirm_post чтобы отправить уведомление всем участникам.")
-    
+
     async def confirm_post_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_admin(update.effective_user.id):
             await update.message.reply_text("❌ У вас нет прав для этой команды.")
@@ -565,7 +563,8 @@ class SchoolBot:
         except Exception as e:
             logger.error(f"Ошибка при отправке сообщения: {e}")
             await update.message.reply_text(f"❌ Ошибка при отправке сообщения: {str(e)}")
-    
+
+    # ---------------- Фото ----------------
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_admin(update.effective_user.id):
             return
@@ -575,8 +574,9 @@ class SchoolBot:
         photo_file_id = update.message.photo[-1].file_id
         caption = update.message.caption or ""
         context.user_data['pending_photo'] = {'file_id': photo_file_id, 'caption': caption}
-        await update.message.reply_text("📸 Фото сохранено! Теперь отправь предмет и задание в формате:\n`Предмет - Задание`\n\nИли используй команду /add_dz с текстом")
-    
+        await update.message.reply_text("📸 Фото сохранено! Теперь отправь предмет и задание в формате:\n`Предмет - Задание`\nИли просто напиши ДЗ в чате — я распознаю.", parse_mode='Markdown')
+
+    # ---------------- Добавление ДЗ (команда) ----------------
     async def add_homework_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_admin(update.effective_user.id):
             await update.message.reply_text("❌ У вас нет прав для добавления ДЗ.")
@@ -584,14 +584,16 @@ class SchoolBot:
         if update.effective_chat.type != "private":
             await update.message.reply_text("❌ Добавлять ДЗ можно только в ЛС с ботом!")
             return
+
         photo_file_id = None
+        caption = ""
         if 'pending_photo' in context.user_data:
             photo_file_id = context.user_data['pending_photo']['file_id']
-            caption = context.user_data['pending_photo']['caption']
-            if caption:
-                homework_text = caption
-            else:
-                homework_text = ""
+            caption = context.user_data['pending_photo'].get('caption', '')
+        # Текст ДЗ — из caption, из аргументов или из текста сообщения
+        homework_text = ""
+        if caption:
+            homework_text = caption
         elif update.message.text:
             full_text = update.message.text
             if full_text.startswith('/add_dz'):
@@ -600,41 +602,43 @@ class SchoolBot:
                 homework_text = full_text
         elif context.args:
             homework_text = " ".join(context.args)
-        else:
-            await update.message.reply_text("📝 *Добавление домашних заданий*\n\nОтправь текст ДЗ или фото с подписью.\n📸 *Фото автоматически прикрепится к ДЗ*\n\nФормат текста:\n```\nЛитература - Написать сочинение\nМатематика - упр 25-26\n```", parse_mode='Markdown')
-            return
+
         if photo_file_id and not homework_text.strip():
             await update.message.reply_text("❌ Напиши предмет и задание в подписи к фото!")
             return
+
         homework_list = self.parser.parse_any_format(homework_text)
         if not homework_list:
-            await update.message.reply_text("❌ Не удалось распознать ДЗ в тексте.\nПопробуй другой формат или используй /parse_dz")
+            await update.message.reply_text("❌ Не удалось распознать ДЗ в тексте. Попробуй другой формат или используй /parse_dz")
             return
+
         added_count = 0
         results = []
-        for subject, task in homework_list:
+        for idx, (subject, task) in enumerate(homework_list):
+            # fuzzy-correct subject (parser уже возвращает normalized subject)
             next_lesson = self.schedule_manager.find_next_lesson(subject)
-            if next_lesson:
-                success = self.db.add_homework(subject, task, next_lesson['time'], next_lesson['day'], photo_file_id if subject == homework_list[0][0] else None)
-                if success:
-                    added_count += 1
-                    day_name = self.schedule_manager.day_names[next_lesson['day']]
-                    photo_mark = " 📸" if photo_file_id and subject == homework_list[0][0] else ""
-                    results.append(f"✅ *{subject}*{photo_mark} → {day_name} ({next_lesson['time']})")
-                else:
-                    results.append(f"❌ *{subject}* - ошибка базы данных")
+            if not next_lesson:
+                results.append(f"❌ *{subject}* — урок не найден в расписании")
+                continue
+            success = self.db.add_homework(subject, task, next_lesson['time'], next_lesson['day'], photo_file_id if idx == 0 else None)
+            if success:
+                added_count += 1
+                day_name = self.schedule_manager.day_names[next_lesson['day']]
+                photo_mark = " 📸" if photo_file_id and idx == 0 else ""
+                results.append(f"✅ *{subject}*{photo_mark} → {day_name} ({next_lesson['time']})")
             else:
-                results.append(f"❌ *{subject}* - урок не найден в расписании")
+                results.append(f"❌ *{subject}* — ошибка базы данных")
+
         if 'pending_photo' in context.user_data:
             del context.user_data['pending_photo']
+
         result_text = "📋 *Результат добавления ДЗ:*\n\n" + "\n".join(results)
         if added_count > 0:
-            result_text += f"\n\n🎯 *Успешно добавлено: {added_count} заданий!*\n"
-            if photo_file_id:
-                result_text += "📸 *Фото прикреплено к первому предмету*\n"
-            result_text += "🗑️ *Каждое ДЗ удалится после своего урока*"
+            result_text += f"\n\n🎯 *Успешно добавлено: {added_count} заданий!*"
+            result_text += "\n🗑️ *Каждое ДЗ удалится после своего урока*"
         await update.message.reply_text(result_text, parse_mode='Markdown')
-    
+
+    # ---------------- Парсинг (команда) ----------------
     async def parse_homework_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_admin(update.effective_user.id):
             await update.message.reply_text("❌ У вас нет прав для этой команды.")
@@ -643,12 +647,12 @@ class SchoolBot:
             await update.message.reply_text("❌ Эта команда только для ЛС!")
             return
         if not context.args:
-            await update.message.reply_text("📄 *Умный парсинг ДЗ*\n\nСкопируй текст с ДЗ и отправь командой:\n`/parse_dz [твой_текст]`\n\n🎯 *Бот работает с ЛЮБЫМ форматом:*\n• Предмет: задание\n• Предмет - задание\n• Просто список предметов и заданий\n\n📝 *Пример:*\n`/parse_dz Математика: упр 25-26 Русский - сочинение Физика задачи 1-5`", parse_mode='Markdown')
+            await update.message.reply_text("📄 *Умный парсинг ДЗ*\n\nСкопируй текст с ДЗ и отправь командой:\n`/parse_dz [твой_текст]`", parse_mode='Markdown')
             return
         text_to_parse = " ".join(context.args)
         homework_list = self.parser.parse_any_format(text_to_parse)
         if not homework_list:
-            await update.message.reply_text("❌ Не удалось найти ДЗ в тексте.\nПопробуй другой формат или используй /add_dz")
+            await update.message.reply_text("❌ Не удалось найти ДЗ в тексте.")
             return
         added_count = 0
         results = []
@@ -666,7 +670,8 @@ class SchoolBot:
         report_text += f"🎯 *Успешно добавлено: {added_count} заданий*\n"
         report_text += "🗑️ *Каждое ДЗ удалится после своего урока*"
         await update.message.reply_text(report_text, parse_mode='Markdown')
-    
+
+    # ---------------- Ручная очистка ----------------
     async def cleanup_now_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_admin(update.effective_user.id):
             await update.message.reply_text("❌ У вас нет прав для этой команды.")
@@ -687,7 +692,8 @@ class SchoolBot:
         except Exception as e:
             logger.error(f"Ошибка при ручной очистке: {e}")
             await update.message.reply_text("❌ Ошибка при очистке ДЗ!")
-    
+
+    # ---------------- Help ----------------
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text = "🤖 *ДОСТУПНЫЕ КОМАНДЫ*\n\n"
         if update.effective_chat.type == "private":
@@ -712,7 +718,8 @@ class SchoolBot:
         help_text += "\n🎯 *Бот автоматически удаляет ДЗ после уроков*"
         help_text += "\n⏰ *КД команды /dz: 4 часа*"
         await update.message.reply_text(help_text, parse_mode='Markdown')
-    
+
+    # ---------------- Показать ДЗ ----------------
     async def homework_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         cooldown_left = self.db.check_cooldown(user_id)
@@ -751,7 +758,7 @@ class SchoolBot:
         if not self.is_admin(user_id):
             homework_text += "\n⏰ *Следующая проверка ДЗ через 4 часа*"
         await update.message.reply_text(homework_text, parse_mode='Markdown')
-    
+    # ---------------- Очистка БД полностью ----------------
     async def clear_homework_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_admin(update.effective_user.id):
             await update.message.reply_text("❌ У вас нет прав для этой команды.")
@@ -764,38 +771,71 @@ class SchoolBot:
             await update.message.reply_text("🗑️ Все домашние задания очищены!")
         else:
             await update.message.reply_text("❌ Ошибка при очистке ДЗ!")
-    
+
+    # ---------------- Авто-ответы по тексту в ЛС ----------------
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        text = update.message.text
-        if update.effective_chat.type != "private" and text.startswith('/'):
-            await update.message.reply_text("🤖 *Доступные команды в группе:*\n\n• /dz - Показать домашние задания\n• /help - Показать все команды\n\n🎯 Бот автоматически удаляет ДЗ после уроков", parse_mode='Markdown')
-            return
+        text = update.message.text.strip()
+
+        # Игнорируем обычных юзеров в ЛС
         if update.effective_chat.type == "private" and not self.is_admin(user_id):
             return
+
+        # Популярные кнопки
         if text == "📅 Расписание на сегодня":
             schedule_text = self.schedule_manager.get_today_schedule()
             await update.message.reply_text(schedule_text)
-        elif text == "➡️ Следующий урок":
+            return
+
+        if text == "➡️ Следующий урок":
             next_lesson = self.schedule_manager.get_next_lesson()
             await update.message.reply_text(next_lesson)
-        elif text == "📚 Домашние задания":
+            return
+
+        if text == "📚 Домашние задания":
             await self.homework_command(update, context)
-        elif text == "➕ Добавить ДЗ" and self.is_admin(user_id):
-            await self.add_homework_command(update, context)
-        elif text == "📄 Спарсить ДЗ" and self.is_admin(user_id):
-            await update.message.reply_text("📄 Отправь текст с ДЗ командой:\n`/parse_dz [твой_текст]`\n\nИли просто скопируй и вставь текст с ДЗ, бот сам всё распознает!", parse_mode='Markdown')
-    
+            return
+
+        # Автоматическое добавление ДЗ простым текстом
+        if self.is_admin(user_id):
+            hw = self.parser.parse_any_format(text)
+            if hw:
+                logger.info(f"Auto-detected homework from plain text: {hw}")
+                await self.add_homework_from_plain(update, context, hw)
+                return
+
+        await update.message.reply_text("🤖 Я не понял сообщение. Используйте кнопки или команды /help")
+
+    async def add_homework_from_plain(self, update: Update, context: ContextTypes.DEFAULT_TYPE, homework_list):
+        """Используется для авто-парсинга текста в ЛС"""
+        added_count = 0
+        results = []
+        for subject, task in homework_list:
+            next_lesson = self.schedule_manager.find_next_lesson(subject)
+            if not next_lesson:
+                results.append(f"❌ *{subject}* — урок не найден в расписании")
+                continue
+            success = self.db.add_homework(subject, task, next_lesson['time'], next_lesson['day'])
+            if success:
+                added_count += 1
+                day_name = self.schedule_manager.day_names[next_lesson['day']]
+                results.append(f"✅ *{subject}* → {day_name} ({next_lesson['time']})")
+
+        result_text = "📌 *Автоматическое добавление ДЗ:*\n\n" + "\n".join(results)
+        await update.message.reply_text(result_text, parse_mode='Markdown')
+
+    # ---------------- Запуск ----------------
     def run(self):
         print("🤖 Бот запущен...")
         self.application.run_polling()
 
-# ============================ ЗАПУСК БОТА ============================
+
+# ============================ ЗАПУСК ============================
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        print("❌ ОШИБКА: Переменная окружения BOT_TOKEN не установлена!")
-        print("📝 Установи на Railway: Settings → Variables → BOT_TOKEN")
+        print("❌ ОШИБКА: BOT_TOKEN не установлен в переменных окружения!")
         exit(1)
-    print("✅ BOT_TOKEN найден, запуск бота...")
+
+    print("🚀 Запуск SchoolBot...")
     bot = SchoolBot(BOT_TOKEN)
     bot.run()
