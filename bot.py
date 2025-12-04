@@ -1,14 +1,13 @@
 """
-schoolbot_v2_ultimate.py
-Ультимативная версия SchoolBot V2 — единый файл.
+schoolbot_v2_ultimate_v2.py
+Полнофункциональная версия V2.2 (один файл).
 
-Требования:
-  pip install python-telegram-bot==20.3 Flask APScheduler
-
+Режим триггеров: B (умный AI-триггер — извлечение смысла и предмета).
 Запуск:
+  pip install python-telegram-bot==20.3 Flask APScheduler
   export BOT_TOKEN="..."
   export WEB_PASS="..."
-  python schoolbot_v2_ultimate.py
+  python schoolbot_v2_ultimate_v2.py
 """
 
 import os
@@ -19,23 +18,24 @@ import datetime
 import difflib
 import csv
 import io
+import re
 from typing import List, Tuple, Optional, Any
 from flask import Flask, request, redirect, url_for, render_template_string, make_response, send_file
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # telegram v20+
-from telegram import Update, ReplyKeyboardMarkup, InputFile
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ---------------- logging ----------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-logger = logging.getLogger("schoolbot_v2_ultimate")
+logger = logging.getLogger("schoolbot_v2_ultimate_v2")
 
 # ---------------- config ----------------
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "6193109213"))
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 WEB_PASS = os.environ.get("WEB_PASS", "admin123")
-DB_PATH = os.environ.get("DB_PATH", "schoolbot_v2_ultimate.db")
+DB_PATH = os.environ.get("DB_PATH", "schoolbot_v2_ultimate_v2.db")
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN is not set. Set environment variable BOT_TOKEN.")
@@ -43,7 +43,7 @@ if not BOT_TOKEN:
 
 # ---------------- Flask app ----------------
 app = Flask(__name__)
-WEB_SESSIONS = {}  # simple in-memory sessions: token -> expiry datetime
+WEB_SESSIONS = {}  # token -> expiry datetime
 
 # ---------------- Database (clean new DB) ----------------
 class Database:
@@ -108,12 +108,11 @@ class Database:
 
     def delete_by_subject(self, subject: str) -> int:
         cur = self.conn.cursor()
-        cur.execute("SELECT id FROM homework WHERE lower(subject)=lower(?)", (subject,))
-        rows = cur.fetchall()
         cur.execute("DELETE FROM homework WHERE lower(subject)=lower(?)", (subject,))
+        cnt = cur.rowcount
         self.conn.commit()
-        logger.info("Deleted %s rows for subject=%s", cur.rowcount, subject)
-        return cur.rowcount
+        logger.info("Deleted %s rows for subject=%s", cnt, subject)
+        return cnt
 
     def clear_all(self) -> int:
         cur = self.conn.cursor()
@@ -124,12 +123,11 @@ class Database:
         return cnt
 
     def cleanup_old_homework(self) -> List[str]:
-        """Delete homework whose lesson time <= now for the same day. Return list of cleaned subjects."""
         cleaned_subjects = []
         cleaned_photos = []
         try:
             now = datetime.datetime.now()
-            rus_today = ScheduleManager.get_russian_day_name(now.weekday())  # e.g. 'понедельник'
+            rus_today = ScheduleManager.get_russian_day_name(now.weekday())
             current_time_str = now.strftime("%H:%M")
             cur = self.conn.cursor()
             cur.execute("SELECT id, subject, time, photo_file_id FROM homework WHERE day=? AND time<=?", (rus_today, current_time_str))
@@ -154,7 +152,7 @@ class Database:
 
 db = Database()
 
-# ---------------- ScheduleManager (same idea as before) ----------------
+# ---------------- ScheduleManager ----------------
 class ScheduleManager:
     def __init__(self):
         self.schedule = {
@@ -216,17 +214,14 @@ class ScheduleManager:
         subj = subject.lower()
         today = self.get_current_day()
         now = datetime.datetime.now().time()
-        # search today first
         if today in self.schedule:
             for lesson in self.schedule[today]:
                 ls_subj = lesson['subject'].lower()
                 if subj in ls_subj or ls_subj in subj:
-                    # lesson start time
                     h, m = map(int, lesson['time'].split(':'))
                     lesson_time = datetime.time(h, m)
                     if now < lesson_time:
                         return {'day': today, 'time': lesson['time'], 'subject': lesson['subject']}
-        # search next days (Mon-Fri)
         days_order = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница']
         if today in days_order:
             idx = days_order.index(today)
@@ -239,7 +234,6 @@ class ScheduleManager:
                     ls_subj = lesson['subject'].lower()
                     if subj in ls_subj or ls_subj in subj:
                         return {'day': d, 'time': lesson['time'], 'subject': lesson['subject']}
-        # fallback: find first occurrence anywhere
         for d, lessons in self.schedule.items():
             for lesson in lessons:
                 if subj in lesson['subject'].lower() or lesson['subject'].lower() in subj:
@@ -255,79 +249,122 @@ MASTER_SUBJECTS = [
     'технология','музыка','изо','обж','мхк','обществознание','офг','твис','ров'
 ]
 
+# map short keywords to canonical subjects (for detection)
+SUBJECT_KEYWORDS = {
+    'математика': ['математика','матем','мат'],
+    'алгебра': ['алгебра','алг'],
+    'геометрия': ['геометрия','геом'],
+    'русский язык': ['русский язык','русский','русск','русяз'],
+    'литература': ['литература','литра'],
+    'физика': ['физика','физ'],
+    'химия': ['химия','хим'],
+    'биология': ['биология','биол'],
+    'история': ['история','ист'],
+    'география': ['география','геогр','гео'],
+    'английский язык': ['английский язык','английский','англ','english'],
+    'информатика': ['информатика','инфа','информ'],
+    'физкультура': ['физкультура','физра','физ-ра'],
+    'технология': ['технология','труд'],
+    'музыка': ['музыка','муз'],
+    'изо': ['изо','изобразительное'],
+    'обж': ['обж','безопасность'],
+    'мхк': ['мхк'],
+    'обществознание': ['обществознание','общ'],
+    'офг': ['офг','финграм','основы финансовой грамотности'],
+    'твис': ['твис','тв'],
+    'ров': ['ров','разговоры о важном']
+}
+
 def normalize_subject(text: str) -> str:
     t = text.strip().lower()
-    # try direct contains
-    for sub in MASTER_SUBJECTS:
-        if t == sub or t in sub or sub in t:
-            return sub
+    for subj, keys in SUBJECT_KEYWORDS.items():
+        for k in keys:
+            if t == k or k in t or t in k:
+                return subj
     matches = difflib.get_close_matches(t, MASTER_SUBJECTS, n=1, cutoff=0.6)
     if matches:
         return matches[0]
     return text.strip()
 
-def parse_any_format(text: str) -> List[Tuple[str,str]]:
-    res = []
-    if not text:
-        return res
-    lines = text.split('\n')
-    for raw in lines:
-        line = raw.strip()
-        if not line:
-            continue
-        # "Subject - task" or "Subject: task"
-        if '-' in line:
-            a,b = line.split('-',1)
-            subj = normalize_subject(a)
-            task = b.strip()
-            res.append((subj, task))
-            continue
-        if ':' in line:
-            a,b = line.split(':',1)
-            subj = normalize_subject(a)
-            task = b.strip()
-            res.append((subj, task))
-            continue
-        # guess first 1..3 words as subject
-        words = line.split()
-        guessed = False
-        for take in range(1, min(4, len(words))+1):
-            cand = ' '.join(words[:take])
-            norm = normalize_subject(cand)
-            if norm != cand or norm in MASTER_SUBJECTS:
-                task = ' '.join(words[take:]).strip()
-                res.append((norm, task if task else ""))
-                guessed = True
-                break
-        if not guessed:
-            res.append(('прочее', line))
-    return res
+def find_subject_in_text(text: str) -> Optional[str]:
+    t = text.lower()
+    # look for explicit "по <subject>" or "<subject>"
+    # first try patterns "по английскому", "по англ", "по алгебре"
+    m = re.search(r'по\s+([а-яё\-\s]+)', t)
+    if m:
+        candidate = m.group(1).strip()
+        # trim punctuation
+        candidate = re.sub(r'[^\w\s\-]', '', candidate)
+        # try normalize
+        sub = normalize_subject(candidate)
+        if sub:
+            return sub
+    # fallback: search for any keyword from SUBJECT_KEYWORDS
+    for subj, keys in SUBJECT_KEYWORDS.items():
+        for k in keys:
+            if re.search(r'\b' + re.escape(k) + r'\b', t):
+                return subj
+    # try single-word that equals subject
+    for subj in MASTER_SUBJECTS:
+        if re.search(r'\b' + re.escape(subj) + r'\b', t):
+            return subj
+    return None
 
-# trigger phrases for any-user requests for showing homework
-USER_SHOW_TRIGGERS = [
-    'скиньте дз','скиньте домашнее','скиньте домашку','скиньте дз,','скинь дз','отправьте дз',
-    'отправьте домашнее задание','отправьте домашку','покажи дз','покажи домашнее','домашка',
-    'дз пж','дз пожалуйста','дз','бот дз','бот, дз','бот, скинь дз','бот дз пж','скажи дз'
+# smart trigger detection (mode B)
+# wide list of request words/phrases — but we'll match whole phrase or short messages, not random embedded words
+REQUEST_TOKENS = [
+    'скиньте дз','скинь дз','скиньте домашку','скинь домашку','кинь дз','кинь домашку',
+    'отправьте дз','отправь дз','отправьте домашку','дай дз','дай домашку',
+    'покажи дз','покажи домашку','что задали','что задали на дом','что задали на завтра',
+    'какая домашка','какое дз','какая домашка на завтра','какая на завтра домашка',
+    'скажи дз','скажите дз','скажите домашку','скажи домашку',
+    'бот дз','бот, дз','бот, скинь дз','бот скинь дз','бот дай дз',
+    'домашка','домашнее задание','дз','дз пж','дз пожалуйста','дз плиз'
 ]
-# Normalize triggers to lowercase and trimmed
-USER_SHOW_TRIGGERS = [t.lower() for t in USER_SHOW_TRIGGERS]
 
-# For admin natural commands detection (rudimentary)
-ADMIN_CMD_PREFIXES = ['удали', 'очисти', 'удалить', 'очистить', 'добавь', 'добавить', 'очистить все', 'удали все', 'очисти все']
+# We'll consider a message a homework request if:
+# - The whole message matches one of REQUEST_TOKENS (or close with punctuation),
+# - OR the message is short (<=6 words) and contains words like 'дз','домашка','что задали' etc.
+# - OR contains "по <subject>" pattern -> subject-specific query.
+def is_homework_request_and_extract_subject(text: str) -> Tuple[bool, Optional[str]]:
+    t = text.lower().strip()
+    t_clean = re.sub(r'[^\w\s\-]', '', t)  # remove punctuation
+    # check explicit "по <subject>"
+    subj = find_subject_in_text(t)
+    if subj:
+        # if user asked e.g. "какая домашка по английскому?" treat as request for that subject
+        # Also catch "есть дз по английскому?" etc.
+        # But make sure message indicates request: contains 'по' OR question words
+        if 'по ' in t or 'есть' in t or '?' in text or 'какая' in t or 'что' in t:
+            return True, subj
+        # if short message includes subject and 'дз' or 'домашка' -> request
+        if any(token in t for token in ['дз','домашк','домашн']):
+            return True, subj
+    # check full phrase matches
+    for token in REQUEST_TOKENS:
+        if t_clean == token or t == token:
+            return True, None
+    # contains any token but only if message is short
+    words = t.split()
+    if len(words) <= 6:
+        for token in REQUEST_TOKENS:
+            if token.split()[0] in words or any(w in token for w in words):
+                # ensure at least one of request keywords present as word
+                if any(k in t for k in ['дз','домашк','что','скажи','покажи','скинь','отправ']):
+                    return True, None
+    # if message contains 'какая домашка' or 'какое дз' with subject
+    if re.search(r'кака[яе]\s+домаш', t) or re.search(r'како[йе]\s+дз', t):
+        return True, subj
+    return False, None
 
 # ---------------- Telegram bot logic ----------------
-# pending photos storage (per admin user id) for attaching to next added HW
 PENDING_PHOTOS = {}  # user_id -> {'file_id':..., 'caption':...}
-
-# We'll create the Application later; keep reference for Flask actions
 GLOBAL_TELEGRAM_APP: Optional[Application] = None
 
-# Utilities to render homework to text
 def format_homework_list(rows: List[Tuple]) -> str:
     if not rows:
         return "📚 Домашних заданий нет."
     out = "📚 *ДОМАШНИЕ ЗАДАНИЯ*\n\n"
-    # group by day
     by_day = {}
     for (hid, subj, task, day, time_str, photo, created) in rows:
         by_day.setdefault(day, []).append((hid, subj, task, time_str, photo, created))
@@ -341,22 +378,41 @@ def format_homework_list(rows: List[Tuple]) -> str:
             out += "━━━━━━━━━━━━━━━━\n\n"
     return out
 
+async def send_homework_all(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    rows = db.list_homework()
+    text = format_homework_list(rows)
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown')
+    except Exception:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+
+async def send_homework_subject(chat_id: int, subject: str, context: ContextTypes.DEFAULT_TYPE):
+    rows = db.list_homework()
+    matches = []
+    for row in rows:
+        hid, subj, task, day, time_str, photo, created = row
+        if subject.lower() in subj.lower() or subj.lower() in subject.lower():
+            matches.append(row)
+    if not matches:
+        await context.bot.send_message(chat_id=chat_id, text=f"По *{subject.title()}* нет ДЗ 👍", parse_mode='Markdown')
+        return
+    text = format_homework_list(matches)
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown')
+
 # Handlers
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    # allow groups to use /start (show simple help)
     keyboard = [["📅 Расписание на сегодня", "➡️ Следующий урок"], ["📚 Домашние задания"]]
     if uid == ADMIN_ID:
         keyboard.append(["➕ Добавить ДЗ", "📄 Спарсить ДЗ"])
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text("🤖 SchoolBot V2 Ultimate\nВыберите действие или напишите команду. Для помощи — /help", reply_markup=reply_markup)
+    await update.message.reply_text("🤖 SchoolBot V2 Ultimate — готов к работе.\n\nИспользуй /help для подсказок.", reply_markup=reply_markup)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = "🆘 *Помощь — команды и подсказки:*\n\n"
-    text += "• /start — меню\n• /dz — показать текущие ДЗ\n• /add_dz <текст> — добавить ДЗ (админ, ЛС)\n• /parse_dz <текст> — парсинг (админ)\n• Отправь фото в ЛС боту — оно прикрепится к следующему добавленному ДЗ.\n\n"
-    text += "Можно просто написать текст в ЛС: например `Алгебра - упр 3.30` — бот сам добавит.\n"
-    text += "В группе любой может вызвать ДЗ фразами вроде: 'бот дз', 'скиньте дз', 'домашка' и т.д.\n"
+    text += "• /start — меню\n• /dz — показать текущие ДЗ\n• /add_dz <текст> — добавить ДЗ (админ в ЛС)\n• /parse_dz <текст> — парсинг (админ)\n• Отправь фото в ЛС боту — оно прикрепится к следующему добавленному ДЗ.\n\n"
+    text += "Можно просто написать фразы вроде: 'скажи дз', 'какая домашка по английскому', 'скиньте дз' — бот поймёт и ответит.\n"
     if uid == ADMIN_ID:
         text += "\n*Админские быстрые команды (натуральный язык):*\n"
         text += "• 'удали геометрия' — удалит ДЗ по предмету\n• 'очисти все дз' — удалит все\n• 'добавь дз Алгебра - упр 5' — добавит быстро\n"
@@ -365,10 +421,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if update.effective_chat.type != "private":
-        # only accept photo in private chat
         await update.message.reply_text("📸 Фото можно отправлять в личные сообщения боту (админу).")
         return
-    # only admin allowed to add photos as attachments
     if uid != ADMIN_ID:
         await update.message.reply_text("❌ Только админ может прикреплять фото к ДЗ.")
         return
@@ -420,26 +474,20 @@ async def dz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = format_homework_list(rows)
     await update.message.reply_text(text, parse_mode='Markdown')
 
-# Admin natural-language commands processing
+# Admin natural-language commands
 async def handle_admin_natural(update: Update, context: ContextTypes.DEFAULT_TYPE, text_lower:str):
     uid = update.effective_user.id
-    # Patterns: удалить/удали/очисти [все|subject]
     if text_lower.startswith(("удали все","удалить все","очисти все","очисти всё","удали всё")):
         cnt = db.clear_all()
         await update.message.reply_text(f"🗑️ Очищено: {cnt} записей.")
         return True
-    # startswith delete by subject
     for prefix in ('удали ','удалить ','очисти ','очисть '):
         if text_lower.startswith(prefix):
             rest = text_lower[len(prefix):].strip()
-            # if rest like 'все' handled above; else delete by subject fuzzy match
-            if rest in ('все','всё','все дз','всё дз','все задания'):
+            if rest in ('все','всё','все дз','все задания'):
                 cnt = db.clear_all()
                 await update.message.reply_text(f"🗑️ Очищено: {cnt} записей.")
                 return True
-            # if phrase like "удали геометрию" or "удали предмет геометрия"
-            # extract last word group as subject candidate
-            # remove word 'предмет' if present
             rest_clean = rest.replace('предмет ','').strip()
             subj_norm = normalize_subject(rest_clean)
             deleted = db.delete_by_subject(subj_norm)
@@ -448,16 +496,14 @@ async def handle_admin_natural(update: Update, context: ContextTypes.DEFAULT_TYP
             else:
                 await update.message.reply_text(f"⚠️ Не найдено заданий по предмету *{subj_norm}*", parse_mode='Markdown')
             return True
-    # add quick: 'добавь дз Алгебра - упр 5'
     for prefix in ('добавь ','добавить '):
         if text_lower.startswith(prefix):
-            rest = update.message.text[len(prefix):].strip()  # keep original casing for parsing
-            # try parse like regular add
+            rest = update.message.text[len(prefix):].strip()
             await process_and_add_hw_from_text(update, context, rest)
             return True
     return False
 
-# Main text handler (handles groups + private)
+# Main text handler
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = (update.message.text or "").strip()
@@ -465,61 +511,52 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text_lower = text.lower()
 
-    # First, if admin natural commands:
+    # Admin natural commands in private
     if uid == ADMIN_ID and update.effective_chat.type == "private":
         handled = await handle_admin_natural(update, context, text_lower)
         if handled:
             return
 
-    # If user trigger phrases for showing homework (works in group and private)
-    # We'll check if any trigger phrase is a substring or fuzzy-like match
-    for trig in USER_SHOW_TRIGGERS:
-        if trig in text_lower:
-            rows = db.list_homework()
-            out = format_homework_list(rows)
-            # In groups send short summary, in private can be full
-            try:
-                await update.message.reply_text(out, parse_mode='Markdown')
-            except Exception:
-                try:
-                    await update.message.reply_text(out)
-                except Exception as e:
-                    logger.exception("Failed sending hw list: %s", e)
+    # smart detection: is it a homework request? and extract subject if present
+    is_req, subj = is_homework_request_and_extract_subject(text)
+    if is_req:
+        # If subject found -> show only that subject
+        if subj:
+            await send_homework_subject(update.effective_chat.id, subj, context)
             return
-
-    # Also allow short exact triggers like "бот дз"
-    if text_lower.strip() in ('бот дз','бот, дз','бот,д з','бот дз пж','бот, скинь дз'):
-        rows = db.list_homework()
-        await update.message.reply_text(format_homework_list(rows), parse_mode='Markdown')
+        # If not subject -> show all
+        await send_homework_all(update.effective_chat.id, context)
         return
 
     # Buttons handling
     if text in ("📅 Расписание на сегодня", "расписание"):
-        await update.message.reply_text(schedule_manager.get_current_day() + "\n(Используй веб-панель для полного расписания)")
+        today = schedule_manager.get_current_day()
+        await update.message.reply_text(f"📅 Сегодня: {today}\n(Полное расписание — в исходном коде или веб-панели)")
         return
     if text in ("➡️ Следующий урок","следующий урок","что дальше"):
-        await update.message.reply_text("Используй предмет: отправь название предмета, и я найду ближайший урок.")
+        await update.message.reply_text("⏰ Отправь название предмета, и я постараюсь найти следующий урок.")
         return
     if text in ("📚 Домашние задания","домашние задания","покажи дз"):
-        rows = db.list_homework()
-        await update.message.reply_text(format_homework_list(rows), parse_mode='Markdown')
+        await send_homework_all(update.effective_chat.id, context)
         return
 
-    # If admin in private writes plain hw -> auto add
+    # Admin auto-add in private: if admin writes plain hw text, add it
     if uid == ADMIN_ID and update.effective_chat.type == "private":
         hw = parse_any_format(text)
         if hw:
             await process_and_add_hw_from_text(update, context, text)
             return
 
-    # Neither recognized -> ignore or reply friendly in private
+    # else, in private give friendly help; in group stay silent to avoid noise
     if update.effective_chat.type == "private":
-        await update.message.reply_text("🤖 Не распознал. Для справки: /help. В группе можно написать 'бот дз' или 'скиньте дз' чтобы получить задания.")
+        await update.message.reply_text("🤖 Не распознал запрос. Для показа ДЗ напиши 'бот дз' или 'какая домашка по английскому'. /help")
     else:
-        # do nothing in group to avoid spam
-        pass
+        # optional small hint in group if bot mentioned directly
+        if re.search(r'\b' + re.escape(context.bot.username if context.bot.username else 'бот') + r'\b', text_lower):
+            await update.message.reply_text("Напишите 'бот дз' или 'какая домашка по <предмет>' чтобы получить домашние задания.")
+        # otherwise ignore
 
-# helper to process and add homework from text (shared for admin and /add_dz)
+# helper to add parsed homework
 async def process_and_add_hw_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     uid = update.effective_user.id
     hw_list = parse_any_format(text)
@@ -532,8 +569,6 @@ async def process_and_add_hw_from_text(update: Update, context: ContextTypes.DEF
         subj_norm = normalize_subject(subj)
         next_lesson = schedule_manager.find_next_lesson(subj_norm)
         if not next_lesson:
-            # if we cannot find lesson, let user specify day/time via web later
-            # choose fallback: today's name
             fallback_day = schedule_manager.get_current_day()
             fallback_time = "00:00"
             hid = db.add_homework(subj_norm, task, fallback_day, fallback_time, photo_entry['file_id'] if photo_entry and idx==0 else None)
@@ -541,16 +576,14 @@ async def process_and_add_hw_from_text(update: Update, context: ContextTypes.DEF
         else:
             hid = db.add_homework(subj_norm, task, next_lesson['day'], next_lesson['time'], photo_entry['file_id'] if photo_entry and idx==0 else None)
             results.append((hid, subj_norm, next_lesson['day'], next_lesson['time'], True))
-    # clear pending photo for this user
     if uid in PENDING_PHOTOS:
         del PENDING_PHOTOS[uid]
-    # reply
     reply = "📋 *Результат добавления ДЗ:*\n\n"
     for hid, subj, day, time_str, found in results:
         if found:
             reply += f"✅ *{subj}* → {day} ({time_str})\n"
         else:
-            reply += f"⚠️ *{subj}* — не найден урок, добавлено как {day} {time_str}\n"
+            reply += f"⚠️ *{subj}* — урок не найден, записано как {day} {time_str}\n"
     await update.message.reply_text(reply, parse_mode='Markdown')
 
 # ---------------- Scheduler: auto-cleanup ----------------
@@ -560,8 +593,7 @@ def cleanup_task():
     try:
         cleaned = db.cleanup_old_homework()
         if cleaned:
-            # notify admin via bot if we have GLOBAL_TELEGRAM_APP
-            logger.info("Cleanup removed subjects: %s", cleaned)
+            logger.info("Cleanup removed: %s", cleaned)
             if GLOBAL_TELEGRAM_APP:
                 async def notify():
                     try:
@@ -569,19 +601,18 @@ def cleanup_task():
                         await GLOBAL_TELEGRAM_APP.bot.send_message(chat_id=ADMIN_ID, text=msg)
                     except Exception as e:
                         logger.exception("Failed to send cleanup notification: %s", e)
-                # schedule in event loop
-                FUT = GLOBAL_TELEGRAM_APP.create_task(notify())
-        else:
-            logger.debug("Cleanup found nothing to remove.")
+                try:
+                    GLOBAL_TELEGRAM_APP.create_task(notify())
+                except Exception:
+                    import asyncio
+                    asyncio.create_task(notify())
     except Exception as e:
         logger.exception("Error in cleanup_task: %s", e)
 
-# run every 10 minutes
-scheduler.add_job(cleanup_task, 'interval', minutes=10, next_run_time=datetime.datetime.now() + datetime.timedelta(seconds=10))
+scheduler.add_job(cleanup_task, 'interval', minutes=10, next_run_time=datetime.datetime.now() + datetime.timedelta(seconds=15))
 scheduler.start()
 
 # ---------------- Flask web UI ----------------
-# Templates (simple but improved)
 BASE_CSS = """
 <style>
 body{font-family:Arial,Helvetica,sans-serif; margin:20px; background:#f7f7f9;}
@@ -762,14 +793,17 @@ def send_photo_admin(hid):
     photo_file_id = row[5]
     if not photo_file_id:
         return render_template_string(CONFIRM_HTML, msg="Фото не присоединено")
-    # Try to send photo to admin via bot
     if GLOBAL_TELEGRAM_APP:
         async def sendit():
             try:
                 await GLOBAL_TELEGRAM_APP.bot.send_photo(chat_id=ADMIN_ID, photo=photo_file_id, caption=f"Фото из записи #{hid} ({row[1]})")
             except Exception as e:
                 logger.exception("Failed to send photo to admin: %s", e)
-        GLOBAL_TELEGRAM_APP.create_task(sendit())
+        try:
+            GLOBAL_TELEGRAM_APP.create_task(sendit())
+        except Exception:
+            import asyncio
+            asyncio.create_task(sendit())
         return render_template_string(CONFIRM_HTML, msg="Фото отправлено админу")
     else:
         return render_template_string(CONFIRM_HTML, msg="Телеграм бот ещё не готов")
@@ -790,11 +824,9 @@ async def on_startup(app_obj: Application):
 def run_bot_and_flask():
     global GLOBAL_TELEGRAM_APP
     start_flask_thread()
-    # build telegram app (async)
     application = Application.builder().token(BOT_TOKEN).build()
     GLOBAL_TELEGRAM_APP = application
 
-    # add handlers
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("dz", dz_cmd))
@@ -803,7 +835,6 @@ def run_bot_and_flask():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # run polling (blocking)
     logger.info("Starting Telegram polling...")
     application.run_polling(stop_signals=None)
 
