@@ -14,12 +14,6 @@ from core import schedule as schedule_mod
 from core import utils as utils_mod
 from modules import tickets, search, checklist, admin_panel_tg
 app.add_handler(CallbackQueryHandler(tickets.callback_query_handler))
-# и в основном text handler:
-if tickets.is_waiting_for_ticket(uid) or tickets.is_admin_waiting_reply(uid):
-    await tickets.integrated_message_handler(update, context)
-    return
-
-
 
 # Автоматическое создание структуры проекта
 os.makedirs("data", exist_ok=True)
