@@ -14,6 +14,14 @@ from core import schedule as schedule_mod
 from core import utils as utils_mod
 from modules import tickets, search, checklist, admin_panel_tg
 
+
+# Автоматическое создание структуры проекта
+os.makedirs("data", exist_ok=True)
+os.makedirs("data/photos", exist_ok=True)
+
+if not os.path.exists("data/logs.txt"):
+    open("data/logs.txt", "w").close()
+    
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SchoolBotV3")
 
