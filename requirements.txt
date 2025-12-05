@@ -4,3 +4,4 @@ tzdata
 aiohttp==3.9.5
 Flask
 APScheduler
+Sqlite3
