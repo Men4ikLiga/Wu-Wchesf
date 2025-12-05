@@ -3,7 +3,7 @@ import os
 import logging
 import asyncio
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, Filters, ContextTypes, CallbackQueryHandler
 
 # local modules
 import config
