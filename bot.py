@@ -1,13 +1,13 @@
+# schoolbot_v2_ultimate.py
 """
-schoolbot_v2_ultimate_v2.py
-Полнофункциональная версия V2.2 (один файл).
-
-Режим триггеров: B (умный AI-триггер — извлечение смысла и предмета).
-Запуск:
+Unified bot + web panel.
+Uses external module tickets_system.py for ticket handling.
+Requirements:
   pip install python-telegram-bot==20.3 Flask APScheduler
+Run:
   export BOT_TOKEN="..."
   export WEB_PASS="..."
-  python schoolbot_v2_ultimate_v2.py
+  python schoolbot_v2_ultimate.py
 """
 
 import os
@@ -19,23 +19,25 @@ import difflib
 import csv
 import io
 import re
-from typing import List, Tuple, Optional, Any
-from flask import Flask, request, redirect, url_for, render_template_string, make_response, send_file
+from typing import List, Tuple, Optional
+from flask import Flask, request, redirect, url_for, render_template_string, make_response
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# telegram v20+
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+
+# import tickets module (separate file)
+import tickets_system as tickets
 
 # ---------------- logging ----------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-logger = logging.getLogger("schoolbot_v2_ultimate_v2")
+logger = logging.getLogger("schoolbot_v2_ultimate")
 
 # ---------------- config ----------------
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "6193109213"))
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 WEB_PASS = os.environ.get("WEB_PASS", "admin123")
-DB_PATH = os.environ.get("DB_PATH", "schoolbot_v2_ultimate_v2.db")
+DB_PATH = os.environ.get("DB_PATH", "schoolbot_v2_ultimate.db")
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN is not set. Set environment variable BOT_TOKEN.")
@@ -45,13 +47,12 @@ if not BOT_TOKEN:
 app = Flask(__name__)
 WEB_SESSIONS = {}  # token -> expiry datetime
 
-# ---------------- Database (clean new DB) ----------------
+# ---------------- Database ----------------
 class Database:
     def __init__(self, path: str = DB_PATH):
         self.path = path
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self._create_tables()
-        logger.info("Database initialized at %s", self.path)
 
     def _create_tables(self):
         cur = self.conn.cursor()
@@ -84,9 +85,7 @@ class Database:
             (subject, task, day, time, photo_file_id)
         )
         self.conn.commit()
-        hid = cur.lastrowid
-        logger.info("Added homework id=%s subj=%s day=%s time=%s", hid, subject, day, time)
-        return hid
+        return cur.lastrowid
 
     def list_homework(self) -> List[Tuple]:
         cur = self.conn.cursor()
@@ -102,16 +101,13 @@ class Database:
         cur = self.conn.cursor()
         cur.execute("DELETE FROM homework WHERE id=?", (hid,))
         self.conn.commit()
-        ok = cur.rowcount > 0
-        logger.info("Delete homework id=%s result=%s", hid, ok)
-        return ok
+        return cur.rowcount > 0
 
     def delete_by_subject(self, subject: str) -> int:
         cur = self.conn.cursor()
         cur.execute("DELETE FROM homework WHERE lower(subject)=lower(?)", (subject,))
         cnt = cur.rowcount
         self.conn.commit()
-        logger.info("Deleted %s rows for subject=%s", cnt, subject)
         return cnt
 
     def clear_all(self) -> int:
@@ -119,7 +115,6 @@ class Database:
         cur.execute("DELETE FROM homework")
         cnt = cur.rowcount
         self.conn.commit()
-        logger.info("Cleared all homework, removed %s rows", cnt)
         return cnt
 
     def cleanup_old_homework(self) -> List[str]:
@@ -144,7 +139,6 @@ class Database:
                 cur.execute("INSERT INTO cleaned_log (cleaned_date, subjects, photo_file_ids) VALUES (?, ?, ?)",
                             (now.strftime("%Y-%m-%d"), ', '.join(list(set(cleaned_subjects))), photo_ids_str))
                 self.conn.commit()
-                logger.info("Auto-cleaned %d homework items", len(ids))
             return list(set(cleaned_subjects))
         except Exception as e:
             logger.exception("Error during cleanup_old_homework: %s", e)
@@ -249,7 +243,6 @@ MASTER_SUBJECTS = [
     'технология','музыка','изо','обж','мхк','обществознание','офг','твис','ров'
 ]
 
-# map short keywords to canonical subjects (for detection)
 SUBJECT_KEYWORDS = {
     'математика': ['математика','матем','мат'],
     'алгебра': ['алгебра','алг'],
@@ -288,30 +281,22 @@ def normalize_subject(text: str) -> str:
 
 def find_subject_in_text(text: str) -> Optional[str]:
     t = text.lower()
-    # look for explicit "по <subject>" or "<subject>"
-    # first try patterns "по английскому", "по англ", "по алгебре"
     m = re.search(r'по\s+([а-яё\-\s]+)', t)
     if m:
         candidate = m.group(1).strip()
-        # trim punctuation
         candidate = re.sub(r'[^\w\s\-]', '', candidate)
-        # try normalize
         sub = normalize_subject(candidate)
         if sub:
             return sub
-    # fallback: search for any keyword from SUBJECT_KEYWORDS
     for subj, keys in SUBJECT_KEYWORDS.items():
         for k in keys:
             if re.search(r'\b' + re.escape(k) + r'\b', t):
                 return subj
-    # try single-word that equals subject
     for subj in MASTER_SUBJECTS:
         if re.search(r'\b' + re.escape(subj) + r'\b', t):
             return subj
     return None
 
-# smart trigger detection (mode B)
-# wide list of request words/phrases — but we'll match whole phrase or short messages, not random embedded words
 REQUEST_TOKENS = [
     'скиньте дз','скинь дз','скиньте домашку','скинь домашку','кинь дз','кинь домашку',
     'отправьте дз','отправь дз','отправьте домашку','дай дз','дай домашку',
@@ -322,37 +307,24 @@ REQUEST_TOKENS = [
     'домашка','домашнее задание','дз','дз пж','дз пожалуйста','дз плиз'
 ]
 
-# We'll consider a message a homework request if:
-# - The whole message matches one of REQUEST_TOKENS (or close with punctuation),
-# - OR the message is short (<=6 words) and contains words like 'дз','домашка','что задали' etc.
-# - OR contains "по <subject>" pattern -> subject-specific query.
 def is_homework_request_and_extract_subject(text: str) -> Tuple[bool, Optional[str]]:
     t = text.lower().strip()
-    t_clean = re.sub(r'[^\w\s\-]', '', t)  # remove punctuation
-    # check explicit "по <subject>"
+    t_clean = re.sub(r'[^\w\s\-]', '', t)
     subj = find_subject_in_text(t)
     if subj:
-        # if user asked e.g. "какая домашка по английскому?" treat as request for that subject
-        # Also catch "есть дз по английскому?" etc.
-        # But make sure message indicates request: contains 'по' OR question words
         if 'по ' in t or 'есть' in t or '?' in text or 'какая' in t or 'что' in t:
             return True, subj
-        # if short message includes subject and 'дз' or 'домашка' -> request
         if any(token in t for token in ['дз','домашк','домашн']):
             return True, subj
-    # check full phrase matches
     for token in REQUEST_TOKENS:
         if t_clean == token or t == token:
             return True, None
-    # contains any token but only if message is short
     words = t.split()
     if len(words) <= 6:
         for token in REQUEST_TOKENS:
             if token.split()[0] in words or any(w in token for w in words):
-                # ensure at least one of request keywords present as word
                 if any(k in t for k in ['дз','домашк','что','скажи','покажи','скинь','отправ']):
                     return True, None
-    # if message contains 'какая домашка' or 'какое дз' with subject
     if re.search(r'кака[яе]\s+домаш', t) or re.search(r'како[йе]\s+дз', t):
         return True, subj
     return False, None
@@ -399,19 +371,49 @@ async def send_homework_subject(chat_id: int, subject: str, context: ContextType
     text = format_homework_list(matches)
     await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown')
 
-# Handlers
+# Custom start with greetings
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    keyboard = [["📅 Расписание на сегодня", "➡️ Следующий урок"], ["📚 Домашние задания"]]
+
+    if uid == ADMIN_ID:
+        greeting = "👑 Рад видеть владельца системы! Готов к работе.\n"
+    elif uid == 6111166190:
+        greeting = "✨ Рад вас видеть, Анастасия!\n"
+    elif uid == 6955239802:
+        greeting = "🔱 Рад вас видеть, Главный Следящий за Бесями — Анжелика Михайловна!\n"
+    else:
+        greeting = (
+            "👋 Приветствую вас заблудшая душа!\n\n"
+            "Вы не являетесь администратором. Вам доступно:\n"
+            "1. Посмотреть домашку — напишите *дз* или */dz*\n"
+            "2. Создать тикет обращение — */ticket*\n"
+        )
+        await update.message.reply_text(greeting, parse_mode="Markdown")
+        return
+
+    keyboard = [
+        ["📚 Домашние задания", "📅 Расписание на сегодня"],
+        ["➡️ Следующий урок"]
+    ]
     if uid == ADMIN_ID:
         keyboard.append(["➕ Добавить ДЗ", "📄 Спарсить ДЗ"])
+
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text("🤖 SchoolBot V2 Ultimate — готов к работе.\n\nИспользуй /help для подсказок.", reply_markup=reply_markup)
+
+    await update.message.reply_text(
+        greeting +
+        "\n📌 Основные команды:\n"
+        "/dz — список ДЗ\n"
+        "Можно спросить: *бот дз*, *какая домашка по физике?*\n"
+        "/ticket — создать тикет обращения\n",
+        parse_mode="Markdown",
+        reply_markup=reply_markup
+    )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = "🆘 *Помощь — команды и подсказки:*\n\n"
-    text += "• /start — меню\n• /dz — показать текущие ДЗ\n• /add_dz <текст> — добавить ДЗ (админ в ЛС)\n• /parse_dz <текст> — парсинг (админ)\n• Отправь фото в ЛС боту — оно прикрепится к следующему добавленному ДЗ.\n\n"
+    text += "• /start — меню\n• /dz — показать текущие ДЗ\n• /add_dz <текст> — добавить ДЗ (админ в ЛС)\n• /parse_dz <текст> — парсинг (админ)\n• /ticket — создать тикет (не-админам)\n\n"
     text += "Можно просто написать фразы вроде: 'скажи дз', 'какая домашка по английскому', 'скиньте дз' — бот поймёт и ответит.\n"
     if uid == ADMIN_ID:
         text += "\n*Админские быстрые команды (натуральный язык):*\n"
@@ -511,27 +513,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text_lower = text.lower()
 
+    # If user is in tickets.create waiting list, let tickets module handle message first
+    if tickets.is_waiting_for_ticket(uid):
+        await tickets.ticket_message_handler(update, context)
+        return
+
     # Admin natural commands in private
     if uid == ADMIN_ID and update.effective_chat.type == "private":
         handled = await handle_admin_natural(update, context, text_lower)
         if handled:
             return
 
-    # smart detection: is it a homework request? and extract subject if present
+    # Smart detection: is it a homework request? and extract subject if present
     is_req, subj = is_homework_request_and_extract_subject(text)
     if is_req:
-        # If subject found -> show only that subject
         if subj:
             await send_homework_subject(update.effective_chat.id, subj, context)
             return
-        # If not subject -> show all
         await send_homework_all(update.effective_chat.id, context)
         return
 
     # Buttons handling
     if text in ("📅 Расписание на сегодня", "расписание"):
         today = schedule_manager.get_current_day()
-        await update.message.reply_text(f"📅 Сегодня: {today}\n(Полное расписание — в исходном коде или веб-панели)")
+        await update.message.reply_text(f"📅 Сегодня: {today}\n(Полное расписание — в веб-панели)")
         return
     if text in ("➡️ Следующий урок","следующий урок","что дальше"):
         await update.message.reply_text("⏰ Отправь название предмета, и я постараюсь найти следующий урок.")
@@ -540,23 +545,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_homework_all(update.effective_chat.id, context)
         return
 
-    # Admin auto-add in private: if admin writes plain hw text, add it
+    # Admin auto-add in private
     if uid == ADMIN_ID and update.effective_chat.type == "private":
         hw = parse_any_format(text)
         if hw:
             await process_and_add_hw_from_text(update, context, text)
             return
 
-    # else, in private give friendly help; in group stay silent to avoid noise
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("🤖 Не распознал запрос. Для показа ДЗ напиши 'бот дз' или 'какая домашка по английскому'. /help")
-    else:
-        # optional small hint in group if bot mentioned directly
-        if re.search(r'\b' + re.escape(context.bot.username if context.bot.username else 'бот') + r'\b', text_lower):
-            await update.message.reply_text("Напишите 'бот дз' или 'какая домашка по <предмет>' чтобы получить домашние задания.")
-        # otherwise ignore
+    # If admin is replying to a ticket answer (tickets module uses admin_reply_waiting)
+    if tickets.is_admin_waiting_reply(uid):
+        await tickets.admin_send_reply(update, context)
+        return
 
-# helper to add parsed homework
+    # private help / group hint
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("🤖 Не распознал запрос. Для показа ДЗ напиши 'бот дз' или 'какая домашка по <предмет>'. /help")
+    else:
+        if re.search(r'\b' + re.escape((context.bot.username or 'бот')) + r'\b', text_lower):
+            await update.message.reply_text("Напишите 'бот дз' или 'какая домашка по <предмет>' чтобы получить домашние задания.")
+        # else ignore to avoid spam
+
 async def process_and_add_hw_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     uid = update.effective_user.id
     hw_list = parse_any_format(text)
@@ -593,7 +601,7 @@ def cleanup_task():
     try:
         cleaned = db.cleanup_old_homework()
         if cleaned:
-            logger.info("Cleanup removed: %s", cleaned)
+            logger.info("Cleanup removed subjects: %s", cleaned)
             if GLOBAL_TELEGRAM_APP:
                 async def notify():
                     try:
@@ -609,10 +617,10 @@ def cleanup_task():
     except Exception as e:
         logger.exception("Error in cleanup_task: %s", e)
 
-scheduler.add_job(cleanup_task, 'interval', minutes=10, next_run_time=datetime.datetime.now() + datetime.timedelta(seconds=15))
+scheduler.add_job(cleanup_task, 'interval', minutes=10, next_run_time=datetime.datetime.now() + datetime.timedelta(seconds=10))
 scheduler.start()
 
-# ---------------- Flask web UI ----------------
+# ---------------- Flask web UI (simple panel) ----------------
 BASE_CSS = """
 <style>
 body{font-family:Arial,Helvetica,sans-serif; margin:20px; background:#f7f7f9;}
@@ -638,7 +646,7 @@ LOGIN_HTML = BASE_CSS + """
 
 HOME_HTML = BASE_CSS + """
 <h2>Панель управления SchoolBot</h2>
-<p><a class="button" href="/add">Добавить ДЗ</a> <a class="button" href="/delete_by_subject">Удалить по предмету</a> <a class="button" href="/clear_all">Очистить все</a> <a class="button" href="/export">Экспорт CSV</a> <a class="button" href="/logout">Выйти</a></p>
+<p><a class="button" href="/add">Добавить ДЗ</a> <a class="button" href="/delete_by_subject">Удалить по предмету</a> <a class="button" href="/clear_all">Очистить все</a> <a class="button" href="/export">Экспорт CSV</a> <a class="button" href="/tickets">Тикеты</a> <a class="button" href="/logout">Выйти</a></p>
 <div class="notice">Всего записей: {{count}}. Фото можно отправить админу: нажми "Отправить фото админу" рядом с записью.</div>
 <table>
 <tr><th>ID</th><th>Предмет</th><th>Задание</th><th>День</th><th>Время</th><th>Фото</th><th>Действия</th></tr>
@@ -681,6 +689,23 @@ DELETE_BY_SUBJ_HTML = BASE_CSS + """
   <div class="form-row"><input type=submit value="Удалить" class="button"></div>
 </form>
 <p><a href="/">Назад</a></p>
+"""
+
+TICKETS_HTML = BASE_CSS + """
+<h2>Тикеты (из модуля)</h2>
+<p><a href="/">Назад</a></p>
+<table>
+<tr><th>ID</th><th>Автор (id)</th><th>Текст</th><th>Статус</th><th>Ответ</th></tr>
+{% for t in tickets %}
+<tr>
+  <td>{{t['id']}}</td>
+  <td>{{t['user_id']}}</td>
+  <td><pre style="white-space:pre-wrap;">{{t['text']}}</pre></td>
+  <td>{{t['status']}}</td>
+  <td><pre style="white-space:pre-wrap;">{{t['admin_response'] or ''}}</pre></td>
+</tr>
+{% endfor %}
+</table>
 """
 
 CONFIRM_HTML = BASE_CSS + """
@@ -808,6 +833,13 @@ def send_photo_admin(hid):
     else:
         return render_template_string(CONFIRM_HTML, msg="Телеграм бот ещё не готов")
 
+@app.route("/tickets")
+@require_login
+def tickets_page():
+    # get tickets from tickets module
+    tlist = tickets.get_all_tickets()
+    return render_template_string(TICKETS_HTML, tickets=tlist)
+
 # Flask runner
 def run_flask():
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
@@ -818,27 +850,32 @@ def start_flask_thread():
     t.start()
     logger.info("Flask started on background thread")
 
-async def on_startup(app_obj: Application):
-    logger.info("Telegram bot started")
-
 def run_bot_and_flask():
     global GLOBAL_TELEGRAM_APP
     start_flask_thread()
     application = Application.builder().token(BOT_TOKEN).build()
     GLOBAL_TELEGRAM_APP = application
 
+    # register handlers
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("dz", dz_cmd))
     application.add_handler(CommandHandler("add_dz", add_dz_cmd))
     application.add_handler(CommandHandler("parse_dz", parse_dz_cmd))
+
+    # tickets handlers (from separate module)
+    application.add_handler(CommandHandler("ticket", tickets.ticket_command))
+    application.add_handler(CallbackQueryHandler(tickets.ticket_callback))
+    # message handler for tickets: ticket module expects to receive non-command messages (ticket content or admin reply)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.integrated_message_handler))
+    # photo and text handlers for other flows should come after ticket handler to allow ticket module to intercept when needed
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    # now general text handler (placed after ticket handler)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Starting Telegram polling...")
     application.run_polling(stop_signals=None)
 
-# ---------------- Entry point ----------------
 if __name__ == "__main__":
     try:
         run_bot_and_flask()
