@@ -5,3 +5,4 @@ aiohttp==3.9.5
 Flask
 APScheduler
 Pillow==10.2.0
+pyTelegramBotAPI
