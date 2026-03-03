@@ -1,8 +1,1 @@
-python-telegram-bot[job-queue]==20.7
-requests==2.31.0
-tzdata
-aiohttp==3.9.5
-Flask
-APScheduler
-Pillow==10.2.0
 pyTelegramBotAPI
