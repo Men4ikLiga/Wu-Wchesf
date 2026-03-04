@@ -1,70 +1,116 @@
-pyTelegramBotAPIimport os
-import os
-import threading
-import time
+import asyncio
+import logging
 from datetime import datetime
+import pytz
 
-# Берем токен из переменных окружения Railway
-TOKEN = os.getenv("BOT_TOKEN")
-bot = telebot.TeleBot(TOKEN)
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command, CommandStart
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# Функция для ожидания времени и отправки отчета
-def schedule_report(chat_id, poll_id, target_time_str):
+# Твой токен бота
+BOT_TOKEN = "ТВОЙ_ТОКЕН_ЗДЕСЬ"
+
+# Часовой пояс МСК+1 (UTC+4)
+TIMEZONE = pytz.timezone('Asia/Samara')
+
+# Инициализация бота, диспетчера и планировщика
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+
+# --- Обработчик команды /start ---
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "Привет! Я бот для создания опросов.\n"
+        "Отправь мне команду в формате:\n"
+        "/op Название опроса, Вариант 1, Вариант 2 . 15:20\n\n"
+        "Время указывай по МСК+1."
+    )
+
+# --- Функция, которая вызовется в назначенное время ---
+async def send_poll_results(chat_id: int, message_id: int):
     try:
-        # Ждем, пока наступит нужное время
-        while True:
-            now = datetime.now().strftime("%H:%M")
-            if now == target_time_str:
-                # Получаем данные опроса (в простейшем виде через остановку)
-                # Важно: Telegram не дает обновлений о каждом голосе без БД, 
-                # поэтому мы останавливаем опрос, чтобы увидеть финальные цифры.
-                result = bot.stop_poll(chat_id, poll_id)
-                
-                report = f"📊 Результаты голосования ({target_time_str}):\n"
-                for option in result.options:
-                    report += f"— {option.text}: {option.voter_count} чел.\n"
-                
-                bot.send_message(chat_id, report)
-                break
-            time.sleep(30) # Проверяем раз в полминуты
+        # Останавливаем опрос, чтобы получить результаты
+        poll = await bot.stop_poll(chat_id=chat_id, message_id=message_id)
+        
+        # Формируем текст с результатами
+        text = f"📊 <b>Результаты опроса: {poll.question}</b>\n\n"
+        for option in poll.options:
+            text += f"▪️ {option.text}: {option.voter_count} голос(ов)\n"
+            
+        text += f"\nВсего голосов: {poll.total_voter_count}"
+        
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
     except Exception as e:
-        print(f"Ошибка в планировщике: {e}")
+        logging.error(f"Ошибка при получении результатов: {e}")
+        await bot.send_message(chat_id=chat_id, text="Не удалось получить результаты опроса. Возможно, сообщение было удалено.")
 
-@bot.message_handler(func=lambda message: True)
-def handle_poll_request(message):
+# --- Обработчик команды /op ---
+@dp.message(Command("op"))
+async def create_poll(message: types.Message):
+    # Убираем саму команду из текста
+    raw_text = message.text.replace('/op ', '', 1).strip()
+    
+    # Проверяем, есть ли точка (разделитель времени)
+    if '.' not in raw_text:
+        await message.answer("Ошибка формата. Не забыл точку перед временем? Пример: /op Вопрос, Да, Нет . 15:20")
+        return
+        
     try:
-        # Парсинг строки: "Вариант 1, вариант 2. 15:30"
-        # 1. Отделяем время (после точки)
-        parts = message.text.split('.')
-        if len(parts) < 2:
-            bot.reply_to(message, "Ошибка! Забыли точку перед временем (например: Вариант 1, Вариант 2. 15:30)")
+        # Разделяем на данные опроса и время
+        poll_data, time_str = raw_text.split('.', 1)
+        time_str = time_str.strip()
+        
+        # Разделяем название и варианты ответа
+        poll_parts = [part.strip() for part in poll_data.split(',')]
+        if len(poll_parts) < 3:
+            await message.answer("Нужно указать название и минимум 2 варианта ответа через запятую.")
             return
             
-        options_part = parts[0].strip()
-        time_part = parts[1].strip()
-
-        # 2. Разделяем варианты (по запятой)
-        options = [opt.strip() for opt in options_part.split(',')]
+        question = poll_parts[0]
+        options = poll_parts[1:]
         
-        if len(options) < 2:
-            bot.reply_to(message, "Нужно минимум 2 варианта через запятую!")
+        # Проверяем лимит Telegram (от 2 до 10 вариантов)
+        if len(options) > 10:
+            await message.answer("Telegram поддерживает максимум 10 вариантов ответа.")
             return
 
-        # 3. Отправляем опрос (не викторина, а обычный)
-        sent_poll = bot.send_poll(
-            chat_id=message.chat.id,
-            question="Ваш выбор:",
+        # Парсим время
+        target_time = datetime.strptime(time_str, "%H:%M")
+        hour = target_time.hour
+        minute = target_time.minute
+        
+        # Отправляем опрос (is_anonymous=False, если хочешь видеть, кто как голосовал)
+        sent_message = await message.answer_poll(
+            question=question,
             options=options,
-            is_anonymous=False  # Можно поставить True, если анонимно
+            is_anonymous=False
         )
-
-        bot.reply_to(message, f"✅ Опрос создан! Пришлю результаты в {time_part}")
-
-        # 4. Запускаем отдельный поток для слежки за временем
-        thread = threading.Thread(target=schedule_report, args=(message.chat.id, sent_poll.poll.id, time_part))
-        thread.start()
-
+        
+        # Планируем задачу на отправку результатов
+        scheduler.add_job(
+            send_poll_results,
+            trigger='cron',
+            hour=hour,
+            minute=minute,
+            args=[message.chat.id, sent_message.message_id]
+        )
+        
+        await message.answer(f"✅ Опрос создан! Результаты придут в {time_str} (МСК+1).")
+        
+    except ValueError:
+        await message.answer("Ошибка в формате времени. Пожалуйста, используй формат ЧЧ:ММ (например, 15:20).")
     except Exception as e:
-        bot.reply_to(message, "Что-то пошло не так. Проверь формат: Вариант 1, Вариант 2. 15:30")
+        await message.answer(f"Произошла непредвиденная ошибка: {e}")
 
-bot.infinity_polling()
+# --- Запуск бота ---
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    # Запускаем планировщик
+    scheduler.start()
+    # Запускаем поллинг
+    await dp.start_polling(bot)
+
+if name == "__main__":
+    asyncio.run(main())
