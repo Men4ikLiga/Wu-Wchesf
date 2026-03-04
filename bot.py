@@ -1,4 +1,4 @@
-import telebot
+import pyTelegramBotAPIimport os
 import os
 import threading
 import time
