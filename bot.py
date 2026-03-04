@@ -7,7 +7,7 @@ from aiogram.filters import Command, CommandStart
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Твой токен бота
-BOT_TOKEN = "ТВОЙ_ТОКЕН_ЗДЕСЬ"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # Фиксированное смещение МСК+1 (UTC+4)
 # Это избавит нас от ошибок UnknownTimeZoneError
