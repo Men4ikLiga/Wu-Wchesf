@@ -7,8 +7,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from openai import AsyncOpenAI
 
 # --- КОНФИГУРАЦИЯ ---
-TOKEN = "8612963274:AAGzscPkGgdB5_zsyBFYADZcLB2Y0sy2GzA"
-GROQ_KEY = "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"
+TOKEN = os.getenv("BOT_TOKEN")
+GROQ_KEY = os.getenv("GROQ_API_KEY")
 
 MAIN_MODEL = "llama-3.3-70b-versatile"
 VISION_MODEL = "llama-3.2-11b-vision-preview" # Если Llama-4 Scout недоступна, это самый стабильный вариант
